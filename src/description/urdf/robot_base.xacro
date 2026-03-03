@@ -14,6 +14,14 @@
   <xacro:property name="wheel_x_offset" value="0.18"/>
   <xacro:property name="wheel_y_offset" value="0.22"/>
 
+    <!-- ================= BASE FOOTPRINT ================= -->
+<link name="base_footprint"/>
+
+<joint name="base_footprint_joint" type="fixed">
+  <parent link="base_footprint"/>
+  <child link="base_link"/>
+  <origin xyz="0 0 0" rpy="0 0 0"/>
+</joint>
   <!-- ================= BASE LINK ================= -->
   <link name="base_link">
     <visual>
@@ -49,32 +57,48 @@
   </gazebo>
 
   <!-- ================= IMU LINK ================= -->
-<link name="imu_link"/>
+  <link name="imu_link">
+    <origin xyz="0 0 0.15" rpy="0 0 0"/>
+  </link>
 
-<joint name="imu_joint" type="fixed">
-  <parent link="base_link"/>
-  <child link="imu_link"/>
-  <origin xyz="0 0 0.15"/>
-</joint>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0 0 0.15"/>
+  </joint>
 
-<gazebo reference="imu_link">
-  <sensor name="imu_sensor" type="imu">
-    <always_on>true</always_on>
-    <update_rate>100</update_rate>
-    <imu>
-      <angular_velocity>
-        <x>true</x>
-        <y>true</y>
-        <z>true</z>
-      </angular_velocity>
-      <linear_acceleration>
-        <x>true</x>
-        <y>true</y>
-        <z>true</z>
-      </linear_acceleration>
-    </imu>
-  </sensor>
-</gazebo>
+  <!-- ================= GPS LINK ================= -->
+  <link name="gps_link">
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+  </link>
+
+  <joint name="gps_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="gps_link"/>
+    <origin xyz="0 0 0.1"/>
+  </joint>
+
+  <!-- ================= LIDAR LINK ================= -->
+  <link name="lidar_link">
+    <origin xyz="0.2 0 0.15" rpy="0 0 0"/>
+  </link>
+
+  <joint name="lidar_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="lidar_link"/>
+    <origin xyz="0.2 0 0.15"/>
+  </joint>
+
+  <!-- ================= CAMERA LINK ================= -->
+  <link name="camera_link">
+    <origin xyz="0.15 0 0.12" rpy="0 0 0"/>
+  </link>
+
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="0.15 0 0.12"/>
+  </joint>
 
   <!-- ================= WHEEL MACRO ================= -->
   <xacro:macro name="wheel" params="name x y">

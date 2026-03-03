@@ -5,9 +5,11 @@
   <xacro:include filename="robot_base.xacro"/>
   <xacro:include filename="robot_control.xacro"/>
   <xacro:include filename="robot_sim.xacro"/>
+  <xacro:include filename="robot_sensors.xacro"/>
 
   <xacro:base/>
   <xacro:control/>
   <xacro:sim/>
+  <xacro:sensors/>
 
 </robot>

@@ -8,33 +8,48 @@ import xacro
 
 def generate_launch_description():
 
+    # ================= ROBOT DESCRIPTION =================
     pkg_desc = get_package_share_directory('description')
-
     xacro_file = os.path.join(pkg_desc, 'urdf', 'robot.urdf.xacro')
 
-    doc = xacro.process_file(
+    robot_description = xacro.process_file(
         xacro_file,
         mappings={}
+    ).toxml()
+
+    # ================= WORLD FILE =================
+    world_file = os.path.join(
+        os.getcwd(),
+        'src',
+        'simulation',
+        'worlds',
+        'mercury.sdf'
     )
 
     return LaunchDescription([
 
+        # Start Gazebo with YOUR world
         ExecuteProcess(
-            cmd=['gz', 'sim', '-r', 'empty.sdf'],
+            cmd=['gz', 'sim', '-r', world_file],
             output='screen'
         ),
 
+        # Bridge topics between Gazebo and ROS2
         Node(
             package='ros_gz_bridge',
             executable='parameter_bridge',
             arguments=[
                 '/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist',
                 '/odom@nav_msgs/msg/Odometry@gz.msgs.Odometry',
-                '/imu@sensor_msgs/msg/Imu@gz.msgs.IMU'
+                '/imu@sensor_msgs/msg/Imu@gz.msgs.IMU',
+                '/gps@sensor_msgs/msg/NavSatFix@gz.msgs.NavSat',
+                '/scan@sensor_msgs/msg/LaserScan@gz.msgs.LaserScan',
+                '/camera/image_raw@sensor_msgs/msg/Image@gz.msgs.Image'
             ],
             output='screen'
         ),
 
+        # Spawn robot into Gazebo
         Node(
             package='ros_gz_sim',
             executable='create',
@@ -44,4 +59,5 @@ def generate_launch_description():
             ],
             output='screen'
         ),
+
     ])

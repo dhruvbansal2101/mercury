@@ -3,16 +3,13 @@
 
   <xacro:macro name="sim">
 
-    <!-- ================= DIFF DRIVE PLUGIN ================= -->
     <gazebo>
   <plugin filename="gz-sim-diff-drive-system"
           name="gz::sim::systems::DiffDrive">
 
-    <!-- Left wheels -->
     <left_joint>front_left_wheel_joint</left_joint>
     <left_joint>rear_left_wheel_joint</left_joint>
 
-    <!-- Right wheels -->
     <right_joint>front_right_wheel_joint</right_joint>
     <right_joint>rear_right_wheel_joint</right_joint>
 
@@ -23,7 +20,7 @@
     <odom_topic>/odom</odom_topic>
 
     <frame_id>odom</frame_id>
-    <child_frame_id>base_link</child_frame_id>
+    <child_frame_id>base_footprint</child_frame_id>
 
   </plugin>
 </gazebo>
