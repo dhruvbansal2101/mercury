@@ -3,8 +3,13 @@ from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.substitutions import FindPackageShare
 from launch.substitutions import PathJoinSubstitution
+from ament_index_python.packages import get_package_share_directory
+import os
+from launch_ros.actions import Node
 
 def generate_launch_description():
+    pkg_desc = get_package_share_directory('description')
+    xacro_file = os.path.join(pkg_desc, 'urdf', 'robot.urdf.xacro')
 
     simulation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -16,17 +21,34 @@ def generate_launch_description():
         )
     )
 
+    lidar_static_transform = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        arguments=[
+            '0', '0', '0',
+            '0', '0', '0',
+            'base_link',
+            'skid_steer_bot/base_footprint/lidar_sensor'
+        ],
+        parameters=[{'use_sim_time': True}],
+        output='screen'
+    )
+
     base = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
+        PythonLaunchDescriptionSource(              
             PathJoinSubstitution([
                 FindPackageShare('bringup'),
                 'launch',
                 'bringup_base.launch.py'
             ])
-        )
+        ),
+        launch_arguments={
+            'xacro_file': xacro_file
+        }.items()
     )
-
+    
     return LaunchDescription([
         simulation,
-        base
+        base,
+        lidar_static_transform
     ])
