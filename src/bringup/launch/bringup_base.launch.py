@@ -46,6 +46,16 @@ def generate_launch_description():
         )
     )
 
+    perception = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare('perception'),
+                'launch',
+                'perception.launch.py'
+            ])
+        )
+    )
+
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
@@ -63,5 +73,6 @@ def generate_launch_description():
         description,
         localization,
         planning,
+        perception,
         rviz_node
     ])
