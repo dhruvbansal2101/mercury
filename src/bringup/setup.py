@@ -30,6 +30,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'twist_to_stamped = bringup.twist_to_stamped:main',
         ],
     },
 )

@@ -5,8 +5,9 @@ from launch_ros.substitutions import FindPackageShare
 from launch.substitutions import PathJoinSubstitution, LaunchConfiguration
 from launch_ros.actions import Node
 
+
 def generate_launch_description():
-    
+
     declare_xacro_file_arg = DeclareLaunchArgument(
         'xacro_file',
         description='Path to the xacro file'
@@ -25,18 +26,6 @@ def generate_launch_description():
         }.items()
     )
 
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        arguments=['-d', PathJoinSubstitution([
-            FindPackageShare('bringup'),
-            'config',
-            'bringup.rviz'
-        ])],
-        output='screen'
-    )
-
     localization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
@@ -47,8 +36,32 @@ def generate_launch_description():
         )
     )
 
+    planning = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare('planning'),
+                'launch',
+                'planning.launch.py'
+            ])
+        )
+    )
+
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        parameters=[{'use_sim_time': True}],
+        arguments=['-d', PathJoinSubstitution([
+            FindPackageShare('bringup'),
+            'config',
+            'bringup.rviz'
+        ])],
+        output='screen'
+    )
+
     return LaunchDescription([
         description,
         localization,
+        planning,
         rviz_node
     ])

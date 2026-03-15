@@ -9,11 +9,11 @@ def generate_launch_description():
 
     pkg_desc = get_package_share_directory('description')
     xacro_file = os.path.join(pkg_desc, 'urdf', 'robot.urdf.xacro')
+    
+    pkg_sim = get_package_share_directory('simulation')
 
     world_file = os.path.join(
-        os.getcwd(),
-        'src',
-        'simulation',
+        pkg_sim,
         'worlds',
         'mercury.sdf'
     )
@@ -51,14 +51,14 @@ def generate_launch_description():
                     arguments=[
                         'diff_drive_controller',
                         '--controller-ros-args',
-                        '--ros-args --remap /diff_drive_controller/cmd_vel:=/cmd_vel'
+                        '--ros-args --remap /diff_drive_controller/cmd_vel:=/cmd_vel_stamped'
                     ],
                     parameters=[{'use_sim_time': True}],
                     output='screen'
                 ),
             ]
         ),
-
+        
         Node(
             package='ros_gz_bridge',
             executable='parameter_bridge',
@@ -72,6 +72,14 @@ def generate_launch_description():
                 '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
                 '/tf@tf2_msgs/msg/TFMessage@gz.msgs.Pose_V',
             ],
+            parameters=[{'use_sim_time': True}],
+            output='screen'
+        ),
+
+        Node(
+            package='bringup',
+            executable='twist_to_stamped',
+            name='twist_to_stamped',
             parameters=[{'use_sim_time': True}],
             output='screen'
         ),
