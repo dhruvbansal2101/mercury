@@ -121,10 +121,10 @@ class RoadLineCostmapNode(Node):
         h, w = frame.shape[:2]
 
         src = np.float32([
-            [w * 0.1, h * 0.85],
-            [w * 0.9, h * 0.85],
-            [w * 0.22, h * 0.75],
-            [w * 0.78, h * 0.75]
+            [w * 0.02, h * 0.65], #bl
+            [w * 0.98, h * 0.65], #br
+            [w * 0.25, h * 0.1], #tl
+            [w * 0.75, h * 0.1] #tr
         ])
 
         dst = np.float32([
@@ -135,6 +135,12 @@ class RoadLineCostmapNode(Node):
         ])
 
         self.homography = cv2.getPerspectiveTransform(src, dst)
+
+        if self.show_debug:
+            dbg = frame.copy()
+            for p in src:
+                cv2.circle(dbg, tuple(p.astype(int)), 6, (0, 0, 255), -1)
+            cv2.imshow("src_points", dbg)
 
     def image_callback(self, msg):
         try:
@@ -147,17 +153,24 @@ class RoadLineCostmapNode(Node):
 
         if self.homography is None:
             self.compute_homography(frame)
+        
+        if self.show_debug:
+            cv2.imshow("1_raw", frame)
 
         bev = cv2.warpPerspective(frame, self.homography, (self.bev_w, self.bev_h))
+        
+        if self.show_debug:
+            cv2.imshow("2_bev", bev)
+        
         mask = self.detect_white_lines(bev)
+        if self.show_debug:
+            cv2.imshow("3_mask", mask)
         grid = self.mask_to_grid(mask, msg.header.stamp)
 
         if grid is not None:
             self.costmap_pub.publish(grid)
 
         if self.show_debug:
-            cv2.imshow("bev", bev)
-            cv2.imshow("mask", mask)
             cv2.waitKey(1)
 
     def detect_white_lines(self, bev):
@@ -202,9 +215,11 @@ class RoadLineCostmapNode(Node):
         bev_res = self.resolution
         bev_h, bev_w = mask.shape
 
+        current_grid = np.zeros((self.map_height, self.map_width), dtype=np.uint8)
+
         white_pixels = np.argwhere(mask > 0)
         if len(white_pixels) == 0:
-            return self._build_grid_msg(stamp)
+            return self._build_grid_msg(stamp, current_grid)
 
         rows = white_pixels[:, 0].astype(np.float64)
         cols = white_pixels[:, 1].astype(np.float64)
@@ -223,22 +238,18 @@ class RoadLineCostmapNode(Node):
 
         valid = (gx >= 0) & (gx < self.map_width) & (gy >= 0) & (gy < self.map_height)
 
-        self.map_grid = (self.map_grid.astype(np.float32) * self.decay_rate).astype(np.uint8)
-        self.map_grid[self.map_grid < 5] = 0
-
-        temp = np.zeros_like(self.map_grid, dtype=np.uint8)
+        temp = np.zeros_like(current_grid, dtype=np.uint8)
         temp[gy[valid], gx[valid]] = 255
 
         dist = cv2.distanceTransform(255 - temp, cv2.DIST_L2, 5)
 
         sigma = 5.0
         cost = np.exp(-(dist**2) / (2 * sigma**2)) * 100
+        current_grid = cost.astype(np.uint8)
 
-        self.map_grid = np.maximum(self.map_grid, cost.astype(np.uint8))
+        return self._build_grid_msg(stamp, current_grid)
 
-        return self._build_grid_msg(stamp)
-
-    def _build_grid_msg(self, stamp):
+    def _build_grid_msg(self, stamp, grid_data):
         grid = OccupancyGrid()
         grid.header = Header()
         grid.header.stamp = stamp
@@ -252,7 +263,7 @@ class RoadLineCostmapNode(Node):
         grid.info.origin.position.y = self.map_origin_y
         grid.info.origin.orientation.w = 1.0
 
-        grid.data = self.map_grid.flatten().tolist()
+        grid.data = grid_data.flatten().tolist()
         return grid
 
 def main():
