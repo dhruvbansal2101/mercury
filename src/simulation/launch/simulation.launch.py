@@ -4,6 +4,7 @@ from launch.actions import ExecuteProcess, TimerAction
 from ament_index_python.packages import get_package_share_directory
 import os
 import xacro
+from launch.actions import ExecuteProcess, TimerAction, SetEnvironmentVariable
 
 def generate_launch_description():
 
@@ -17,9 +18,33 @@ def generate_launch_description():
         'worlds',
         'mercury.sdf'
     )
+    # Build photo model blocks dynamically with correct absolute paths
+    images_dir = os.path.join(pkg_sim, 'models', 'images')
+
+    # Read the world SDF and inject the correct image paths
+    import re
+    with open(world_file, 'r') as f:
+        world_content = f.read()
+
+    for i in range(1, 7):
+        world_content = world_content.replace(
+            f'photo{i}.jpg',
+            f'file://{images_dir}/photo{i}.jpg'
+        )
+
+    # Write to a temp file
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.sdf', delete=False)
+    tmp.write(world_content)
+    tmp.flush()
+    world_file = tmp.name
 
     return LaunchDescription([
 
+        SetEnvironmentVariable(
+            'GZ_SIM_RESOURCE_PATH',
+            os.path.join(pkg_sim, 'models') + ':' + os.path.join(pkg_sim, 'models', 'images')
+        ),
         ExecuteProcess(
             cmd=['gz', 'sim', '-r', world_file],
             output='screen'

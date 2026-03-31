@@ -79,7 +79,148 @@
         </visual>
       </link>
     </model>
+    <!--
+  ==================== PHOTO GALLERY VARIABLES ====================
+  Adjust these to reposition/resize the entire gallery:
 
+  START_X, START_Y, START_Z   → position of the first photo
+  STEP_X,  STEP_Y,  STEP_Z    → offset between consecutive photos
+  BOX_THIN                    → thickness of the canvas (keep small)
+  BOX_W                       → width of each canvas
+  BOX_H                       → height of each canvas
+  YAW                         → rotation to face the right direction
+                                 (0=faces +X, 1.5708=faces +Y, 3.1416=faces -X)
+
+  Current values: photos lined up along Y-axis, facing left (-X direction)
+  ================================================================
+-->
+
+    <!-- photo 1 -->
+    <model name="photo_1">
+      <static>true</static>
+      <pose>-13.0 -50.0 1.5 0 0 1.5708</pose>
+      <link name="link">
+        <visual name="photo">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+          <material>
+            <diffuse>1 1 1 1</diffuse>
+            <specular>0 0 0 1</specular>
+            <emissive>1 1 1 1</emissive>
+            <pbr><metal><albedo_map>photo1.jpg</albedo_map><emissive_map>photo1.jpg</emissive_map></metal></pbr>
+          </material>
+          <cast_shadows>false</cast_shadows>
+        </visual>
+        <collision name="col">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+        </collision>
+      </link>
+    </model>
+
+    <!-- photo 2  (START_Y + 1*STEP_Y) -->
+    <model name="photo_2">
+      <static>true</static>
+      <pose>-10.5 -50.0 1.5 0 0 1.5708</pose>
+      <link name="link">
+        <visual name="photo">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+          <material>
+            <diffuse>1 1 1 1</diffuse>
+            <specular>0 0 0 1</specular>
+            <emissive>1 1 1 1</emissive>
+            <pbr><metal><albedo_map>photo2.jpg</albedo_map><emissive_map>photo2.jpg</emissive_map></metal></pbr>
+          </material>
+          <cast_shadows>false</cast_shadows>
+        </visual>
+        <collision name="col">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+        </collision>
+      </link>
+    </model>
+
+    <!-- photo 3  (START_Y + 2*STEP_Y) -->
+    <model name="photo_3">
+      <static>true</static>
+      <pose>-8.0 -50.0 1.5 0 0 1.5708</pose>
+      <link name="link">
+        <visual name="photo">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+          <material>
+            <diffuse>1 1 1 1</diffuse>
+            <specular>0 0 0 1</specular>
+            <emissive>1 1 1 1</emissive>
+            <pbr><metal><albedo_map>photo3.jpg</albedo_map><emissive_map>photo3.jpg</emissive_map></metal></pbr>
+          </material>
+          <cast_shadows>false</cast_shadows>
+        </visual>
+        <collision name="col">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+        </collision>
+      </link>
+    </model>
+
+    <!-- photo 4  (START_Y + 3*STEP_Y) -->
+    <model name="photo_4">
+      <static>true</static>
+      <pose>-5.5 -50.0 1.5 0 0 1.5708</pose>
+      <link name="link">
+        <visual name="photo">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+          <material>
+            <diffuse>1 1 1 1</diffuse>
+            <specular>0 0 0 1</specular>
+            <emissive>1 1 1 1</emissive>
+            <pbr><metal><albedo_map>photo4.jpg</albedo_map><emissive_map>photo4.jpg</emissive_map></metal></pbr>
+          </material>
+          <cast_shadows>false</cast_shadows>
+        </visual>
+        <collision name="col">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+        </collision>
+      </link>
+    </model>
+
+    <!-- photo 5  (START_Y + 4*STEP_Y) -->
+    <model name="photo_5">
+      <static>true</static>
+      <pose>-3.0 -50.0 1.5 0 0 1.5708</pose>
+      <link name="link">
+        <visual name="photo">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+          <material>
+            <diffuse>1 1 1 1</diffuse>
+            <specular>0 0 0 1</specular>
+            <emissive>1 1 1 1</emissive>
+            <pbr><metal><albedo_map>photo5.jpg</albedo_map><emissive_map>photo5.jpg</emissive_map></metal></pbr>
+          </material>
+          <cast_shadows>false</cast_shadows>
+        </visual>
+        <collision name="col">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+        </collision>
+      </link>
+    </model>
+
+    <!-- photo 6  (START_Y + 5*STEP_Y) -->
+    <model name="photo_6">
+      <static>true</static>
+      <pose>-0.5 -50.0 1.5 0 0 1.5708</pose>
+      <link name="link">
+        <visual name="photo">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+          <material>
+            <diffuse>1 1 1 1</diffuse>
+            <specular>0 0 0 1</specular>
+            <emissive>1 1 1 1</emissive>
+            <pbr><metal><albedo_map>photo6.jpg</albedo_map><emissive_map>photo6.jpg</emissive_map></metal></pbr>
+          </material>
+          <cast_shadows>false</cast_shadows>
+        </visual>
+        <collision name="col">
+          <geometry><box><size>0.02 1.5 1.5</size></box></geometry>
+        </collision>
+      </link>
+    </model>
+          
   </world>
 
 </sdf>
