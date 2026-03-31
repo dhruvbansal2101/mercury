@@ -2,18 +2,20 @@
 <sdf version="1.9">
   <model name="ugvc_track">
     <static>true</static>
+    <pose>0 0 0 -1.5708 0 0</pose>
     <link name="link">
       <visual name="visual">
         <geometry>
           <mesh>
-            <uri>model://ugvc_track/meshes/ugvc_track.dae</uri>
+            <uri>model://ugvc_track/meshes/jaiblender.dae</uri>
+            <scale>1 1 1</scale>
           </mesh>
         </geometry>
       </visual>
       <collision name="collision">
         <geometry>
           <mesh>
-            <uri>model://ugvc_track/meshes/ugvc_track.dae</uri>
+            <uri>model://ugvc_track/meshes/jaiblender.dae</uri>
           </mesh>
         </geometry>
       </collision>

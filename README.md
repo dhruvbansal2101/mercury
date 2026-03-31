@@ -11,6 +11,7 @@ sudo docker compose run ros
 # How to run simulation
 
 ```
+echo 'export GZ_SIM_RESOURCE_PATH=$(ros2 pkg prefix simulation)/share/simulation/models:$GZ_SIM_RESOURCE_PATH' >> ~/.bashrc
 colcon build
 ros2 launch bringup bringup_sim.launch.py
 ```

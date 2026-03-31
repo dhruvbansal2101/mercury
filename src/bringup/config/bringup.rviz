@@ -7,6 +7,7 @@ Panels:
         - /Global Options1
         - /Status1
         - /Map1
+        - /Map2
         - /Map3
       Splitter Ratio: 0.5
     Tree Height: 616
@@ -35,7 +36,7 @@ Visualization Manager:
       Cell Size: 1
       Class: rviz_default_plugins/Grid
       Color: 160; 160; 164
-      Enabled: true
+      Enabled: false
       Line Style:
         Line Width: 0.029999999329447746
         Value: Lines
@@ -46,9 +47,9 @@ Visualization Manager:
         Y: 0
         Z: 0
       Plane: XY
-      Plane Cell Count: 10
+      Plane Cell Count: 100
       Reference Frame: <Fixed Frame>
-      Value: true
+      Value: false
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
       Collision Enabled: false
@@ -310,25 +311,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 22.20684051513672
+      Distance: 37.5394287109375
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.3129017949104309
-        Y: -0.09166219830513
-        Z: 0.49167847633361816
+        X: 3.5927388668060303
+        Y: -0.04206636920571327
+        Z: 0.4833587110042572
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.1053982973098755
+      Pitch: 1.3603984117507935
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 3.080397129058838
+      Yaw: 3.135399103164673
     Saved: ~
 Window Geometry:
   Displays:
