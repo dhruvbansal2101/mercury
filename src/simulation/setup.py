@@ -24,6 +24,8 @@ setup(
 
         (os.path.join('share', package_name, 'models/ugvc_track/meshes'),
             glob('models/ugvc_track/meshes/*')),
+        (os.path.join('share', package_name, 'models/images'),
+            glob('models/images/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
