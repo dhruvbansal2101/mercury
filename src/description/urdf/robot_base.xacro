@@ -211,8 +211,8 @@
     <geometry>
       <box size="0.05 0.05 0.05"/>
     </geometry>
-    <material name="red">
-      <color rgba="1 0 0 1"/>
+    <material name="blue">
+      <color rgba="0 0 1 1"/>
     </material>
   </visual>
 
@@ -232,7 +232,7 @@
 <joint name="side_camera_joint" type="fixed">
   <parent link="base_link"/>
   <child link="side_camera_link"/>
-  <origin xyz="0.18 0.12 0.22"/>
+  <origin xyz="0.15 0 2" rpy="0 0.4 0"/>
 </joint>
 
 
