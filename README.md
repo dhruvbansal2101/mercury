@@ -1,4 +1,3 @@
-````md
 # mercury  
 Official repository for **ICMTC UGVC-2026**
 
@@ -34,7 +33,7 @@ colcon build
 
 # Source workspace
 source install/setup.bash
-````
+```
 
 ---
 
