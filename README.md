@@ -125,6 +125,19 @@ ros2 launch watchdog_monitor dashboard.launch.py
 
 ---
 
+## Turret Control
+
+To manually move the turret, publish commands to the controller:
+
+```bash
+ros2 topic pub /turret_controller/commands std_msgs/msg/Float64MultiArray "{data: [1.0, 0.0]}"
+```
+
+* The array represents joint commands (e.g., yaw, pitch).
+* Adjust values based on your turret configuration.
+
+---
+
 ## Waypoint Configuration
 
 Edit `config/waypoints.yaml`:
