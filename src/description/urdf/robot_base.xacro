@@ -104,16 +104,138 @@
     <joint name="lidar_joint" type="fixed">
       <parent link="base_link"/>
       <child link="lidar_link"/>
-      <origin xyz="0.11 0 0.22"/>
+      <origin xyz="0.22 0 0.22"/>
     </joint>
+    <!-- ================= PAN LINK ================= -->
+<link name="pan_link">
+  <visual>
+    <geometry>
+      <cylinder radius="0.05" length="0.02"/>
+    </geometry>
+    <material name="red">
+      <color rgba="1 0 0 1"/>
+    </material>
+  </visual>
 
-    <link name="camera_link"/>
+  <collision>
+    <geometry>
+      <cylinder radius="0.05" length="0.02"/>
+    </geometry>
+  </collision>
 
-    <joint name="camera_joint" type="fixed">
-      <parent link="base_link"/>
-      <child link="camera_link"/>
-      <origin xyz="0.15 0 2" rpy="0 0.4 0"/>
-    </joint>
+  <inertial>
+    <mass value="0.5"/>
+    <origin xyz="0 0 0"/>
+    <inertia ixx="0.01" iyy="0.01" izz="0.01"
+             ixy="0" ixz="0" iyz="0"/>
+  </inertial>
+</link>
+
+<joint name="pan_joint" type="revolute">
+  <parent link="base_link"/>
+  <child link="pan_link"/>
+  <origin xyz="0.12 0 0.21"/>
+  <axis xyz="0 0 1"/>
+  <limit lower="-3.14" upper="3.14" effort="5" velocity="1"/>
+  <dynamics damping="0.1" friction="0.1"/>
+</joint>
+
+<!-- ================= TILT LINK ================= -->
+<link name="tilt_link">
+  <visual>
+    <geometry>
+      <box size="0.04 0.04 0.02"/>
+    </geometry>
+    <material name="black">
+      <color rgba="0.1 0.1 0.1 1"/>
+    </material>
+  </visual>
+
+  <collision>
+    <geometry>
+      <box size="0.04 0.04 0.02"/>
+    </geometry>
+  </collision>
+
+  <inertial>
+    <mass value="0.3"/>
+    <origin xyz="0 0 0"/>
+    <inertia ixx="0.005" iyy="0.005" izz="0.005"
+             ixy="0" ixz="0" iyz="0"/>
+  </inertial>
+</link>
+
+<joint name="tilt_base_joint" type="revolute">
+  <parent link="pan_link"/>
+  <child link="tilt_link"/>
+  <origin xyz="0 0 0.05"/>
+  <axis xyz="0 1 0"/>
+  <limit lower="-1.57" upper="1.57" effort="5" velocity="1"/>
+  <dynamics damping="0.1" friction="0.1"/>
+</joint>
+
+<!-- ================= TURRET CAMERA ================= -->
+<link name="turret_camera_link">
+  <visual>
+    <geometry>
+      <box size="0.05 0.05 0.05"/>
+    </geometry>
+    <material name="Red">
+      <color rgba="1 0 0 1"/>
+    </material>
+  </visual>
+
+  <collision>
+    <geometry>
+      <box size="0.05 0.05 0.05"/>
+    </geometry>
+  </collision>
+
+  <inertial>
+    <mass value="0.3"/>
+    <origin xyz="0 0 0"/>
+    <inertia ixx="0.005" iyy="0.005" izz="0.005"
+             ixy="0" ixz="0" iyz="0"/>
+  </inertial>
+</link>
+<joint name="turret_camera_joint" type="fixed">
+  <parent link="tilt_link"/>
+  <child link="turret_camera_link"/>
+  <origin xyz="0 0 0.03"/>
+</joint>
+
+
+<!-- ================= LANE CAMERA ================= -->
+<link name="camera_link">
+  <visual>
+    <geometry>
+      <box size="0.05 0.05 0.05"/>
+    </geometry>
+    <material name="blue">
+      <color rgba="0 0 1 1"/>
+    </material>
+  </visual>
+
+  <collision>
+    <geometry>
+      <box size="0.05 0.05 0.05"/>
+    </geometry>
+  </collision>
+
+  <inertial>
+    <mass value="0.3"/>
+    <origin xyz="0 0 0"/>
+    <inertia ixx="0.005" iyy="0.005" izz="0.005"
+             ixy="0" ixz="0" iyz="0"/>
+  </inertial>
+</link>
+
+<joint name="camera_joint" type="fixed">
+  <parent link="base_link"/>
+  <child link="camera_link"/>
+  <origin xyz="0.15 0 2" rpy="0 0.4 0"/> <!-- chcanged camera and turret positions-->
+</joint>
+
 
     <xacro:macro name="wheel" params="name x y">
 

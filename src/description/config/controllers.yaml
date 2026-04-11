@@ -8,6 +8,10 @@ controller_manager:
     diff_drive_controller:
       type: diff_drive_controller/DiffDriveController
 
+    turret_controller:
+      type: position_controllers/JointGroupPositionController
+
+
 diff_drive_controller:
   ros__parameters:
     left_wheel_names: ["front_left_wheel_joint", "rear_left_wheel_joint"]
@@ -19,3 +23,10 @@ diff_drive_controller:
     base_frame_id: base_link
     odom_frame_id: odom
     enable_odom_tf: true
+
+
+turret_controller:
+  ros__parameters:
+    joints:
+      - pan_joint
+      - tilt_base_joint

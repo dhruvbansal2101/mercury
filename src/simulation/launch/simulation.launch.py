@@ -81,6 +81,13 @@ def generate_launch_description():
                     parameters=[{'use_sim_time': True}],
                     output='screen'
                 ),
+                Node(
+                    package='controller_manager',
+                    executable='spawner',
+                    arguments=['turret_controller'],
+                    parameters=[{'use_sim_time': True}],
+                    output='screen'
+                ),
             ]
         ),
         
@@ -93,6 +100,7 @@ def generate_launch_description():
                 '/imu@sensor_msgs/msg/Imu@gz.msgs.IMU',
                 '/gps@sensor_msgs/msg/NavSatFix@gz.msgs.NavSat',
                 '/scan@sensor_msgs/msg/LaserScan@gz.msgs.LaserScan',
+                '/turret_camera/image_raw@sensor_msgs/msg/Image@gz.msgs.Image',
                 '/camera/image_raw@sensor_msgs/msg/Image@gz.msgs.Image',
                 '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
                 '/tf@tf2_msgs/msg/TFMessage@gz.msgs.Pose_V',
