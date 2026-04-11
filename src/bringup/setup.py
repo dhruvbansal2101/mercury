@@ -33,6 +33,7 @@ setup(
             'twist_to_stamped = bringup.twist_to_stamped:main',
             # NEW: lane-assist correction node
             'lane_assist_node = bringup.lane_assist_node:main',
+            'goal_decomposer  = bringup.goal_decomposer:main',
         ],
     },
 )

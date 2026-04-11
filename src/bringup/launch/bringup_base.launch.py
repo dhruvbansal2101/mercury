@@ -63,16 +63,17 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'use_sim_time': True,
-            # ── tuning knobs ──────────────────────────────────────────
-            # Proportional gain.  Start here, increase if correction is sluggish.
-            # Decrease / add Kd if the robot oscillates.
-            'Kp': 0.3,
-            # Hard cap on how much angular.z the node can add (rad/s).
-            # Keep at ~30 % of DWB max_vel_theta so Nav2 keeps authority.
+            # Reduced Kp since the EMA in lane_detection now smooths the
+            # error — less proportional gain needed to avoid oscillation.
+            'Kp': 0.18,
+            # Kd helps damp the derivative spike when switching between
+            # 'both lanes' and 'single lane' mode on curves.
+            'Kd': 0.08,
             'max_correction': 0.3,
-            # Must match (bev_width / 2) in lane_detection_node.
             'image_half_width': 320.0,
-            # Pass-through if no lane message arrives within this many seconds.
+            # Slightly larger dead-band so small residual EMA errors on
+            # straights don't cause constant micro-corrections.
+            'dead_band_px': 25.0,
             'timeout_sec': 0.5,
         }]
     )
@@ -91,6 +92,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        declare_xacro_file_arg,
         description,
         localization,
         planning,
