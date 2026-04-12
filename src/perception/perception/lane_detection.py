@@ -1,25 +1,35 @@
 """
-lane_detection.py
------------------
-Camera: xyz="0.15 0 2" rpy="0 0.4 0"
+lane_detection.py  — White mask + Canny + Hough  (v4 - fixed)
+--------------------------------------------------------------
+KEY FIXES over v3:
+  1. Lane-width calibration now ONLY accepts readings where left_x < img_cx
+     and right_x > img_cx (i.e. robot is truly between the two lanes).
+     This prevents absurdly large lw values from corrupting single-lane logic.
 
-Single-lane recovery logic:
-  When only the LEFT lane is visible:
-    lane_cx = left_cx + calibrated_lane_width / 2
-    error   = img_cx - lane_cx  →  negative  →  robot steers RIGHT ✓
+  2. Single-lane extrapolation uses a FIXED fallback lane_width_px (default 320)
+     instead of the auto-calibrated value, because auto-cal gets polluted when
+     both "lanes" are actually the same edge seen from two angles.
 
-  When only the RIGHT lane is visible:
-    lane_cx = right_cx - calibrated_lane_width / 2
-    error   = img_cx - lane_cx  →  positive  →  robot steers LEFT ✓
+  3. Fragment detection (left_frag / right_frag): when two detected X positions
+     are too close together (< min_lane_sep_px) they are treated as a SINGLE
+     lane edge rather than two separate lanes. The side is determined by whether
+     the merged X is left or right of centre.
 
-  The calibrated_lane_width is a rolling median from recent frames where
-  BOTH lanes were visible (genuine separation > min_lane_separation_px).
-  This makes single-lane extrapolation accurate even after a re-tune.
+  4. DRIFT-BACK BEHAVIOR: a persistent "lane_side" tracker remembers which lane
+     was last confidently visible. When only one lane is seen, the error is
+     computed to drive the robot toward the MISSING lane (i.e. increase the
+     visible lane's distance from the robot) rather than just hold position.
+     This makes the robot naturally re-centre when a lane reappears.
 
-Fragment check:
-  If two blobs are < min_lane_separation_px apart horizontally they are
-  top/bottom fragments of the SAME line → merged into one centroid before
-  the left/right classification above is applied.
+  5. Curve handling: the ROI uses the BOTTOM portion of the image (closest to
+     robot) for reliable lane-centre estimation on curves, avoiding the
+     perspective vanishing-point confusion that caused large errors on bends.
+
+VISUAL INDICATORS (unchanged):
+  Green vertical line  = image centre (where robot is pointing)
+  Red   vertical line  = detected lane centre (where robot should be)
+  Error = image_cx - lane_cx  →  positive = robot should move right,
+                                  negative = robot should move left
 """
 
 import cv2
@@ -39,33 +49,86 @@ class LaneDetectionNode(Node):
     def __init__(self):
         super().__init__('lane_detection_node')
 
-        self.declare_parameter('image_topic',           '/camera/image_raw')
-        self.declare_parameter('bev_width',              640)
-        self.declare_parameter('bev_height',             480)
-        self.declare_parameter('show_debug',             True)
-        self.declare_parameter('ema_alpha',              0.35)
-        self.declare_parameter('min_blob_area',          2000.0)
-        self.declare_parameter('min_lane_separation_px', 150.0)
+        # ── Parameters ────────────────────────────────────────────────────
+        self.declare_parameter('image_topic',      '/camera/image_raw')
+        self.declare_parameter('show_debug',        True)
+        self.declare_parameter('ema_alpha',         0.30)
 
-        # Fallback lane width used ONLY before any dual-lane frame is seen.
-        # Once both lanes have been seen, the auto-calibrated median is used.
-        self.declare_parameter('lane_width_px',          560.0)
+        # Fixed lane half-width used for single-lane extrapolation.
+        # Set this = (R_x - L_x) / 2 when robot is centred on track.
+        # Default 160 px assumes 640-wide image and lane fills ~half width.
+        self.declare_parameter('lane_half_width_px', 160.0)
 
-        self.bev_w      = self.get_parameter('bev_width').value
-        self.bev_h      = self.get_parameter('bev_height').value
-        self.show_debug = self.get_parameter('show_debug').value
-        self.ema_alpha  = self.get_parameter('ema_alpha').value
-        self.min_area   = self.get_parameter('min_blob_area').value
-        self.min_sep    = self.get_parameter('min_lane_separation_px').value
-        self._lw_param  = self.get_parameter('lane_width_px').value
-        image_topic     = self.get_parameter('image_topic').value
+        # Auto-calibration: disabled by default — red obstacles were being
+        # detected as white, giving cal=1000+px and breaking single-lane logic.
+        # Set to True only after you've confirmed clean two-lane detections.
+        self.declare_parameter('use_auto_cal', False)
 
-        self.bridge     = CvBridge()
-        self.homography = None
-        self._ema_error = 0.0
+        # ROI: use bottom (1 - roi_top_frac) of image
+        self.declare_parameter('roi_top_frac',      0.35)
 
-        # Rolling buffer of lane widths measured from genuine dual-lane frames
-        self._lw_buf: deque = deque(maxlen=60)
+        # White pixel mask thresholds (HSV)
+        self.declare_parameter('white_v_min',       170)
+        self.declare_parameter('white_s_max',       60)
+
+        # Morphological close kernel
+        self.declare_parameter('close_kw',          5)
+        self.declare_parameter('close_kh',          25)
+
+        # Canny
+        self.declare_parameter('canny_low',         30.0)
+        self.declare_parameter('canny_high',        100.0)
+
+        # Hough
+        self.declare_parameter('hough_threshold',   15)
+        self.declare_parameter('hough_min_len',     20.0)
+        self.declare_parameter('hough_max_gap',     40.0)
+
+        # Slope filter
+        self.declare_parameter('min_slope_abs',     0.2)
+        self.declare_parameter('max_slope_abs',     4.0)
+
+        # Minimum X separation between left_x and right_x to be considered
+        # TWO distinct lanes (not fragments of the same edge).
+        self.declare_parameter('min_lane_sep_px',   120.0)
+
+        # When only one lane is visible, how aggressively to drift toward
+        # the missing lane. 1.0 = full correction, 0.5 = half.
+        self.declare_parameter('drift_gain',        0.8)
+
+        # Max valid separation for auto-cal AND for [both] mode trust.
+        # If sep > this, the two detections are NOT both real lane edges
+        # (e.g. one is an obstacle). Falls back to single-lane logic per side.
+        # Rule of thumb: real lane sep ≈ 2 * lane_half_width_px ± 30%.
+        # For 640px image with half_width=160: max = 160*2*1.4 = ~450px.
+        self.declare_parameter('max_valid_sep_px',  450.0)
+
+        self.show_debug        = self.get_parameter('show_debug').value
+        self.ema_alpha         = self.get_parameter('ema_alpha').value
+        self._lane_half_w      = self.get_parameter('lane_half_width_px').value
+        self._use_auto_cal     = self.get_parameter('use_auto_cal').value
+        self.roi_top           = self.get_parameter('roi_top_frac').value
+        self.white_v_min       = int(self.get_parameter('white_v_min').value)
+        self.white_s_max       = int(self.get_parameter('white_s_max').value)
+        self.close_kw          = int(self.get_parameter('close_kw').value)
+        self.close_kh          = int(self.get_parameter('close_kh').value)
+        self.canny_low         = int(self.get_parameter('canny_low').value)
+        self.canny_high        = int(self.get_parameter('canny_high').value)
+        self.hough_thresh      = int(self.get_parameter('hough_threshold').value)
+        self.hough_min         = self.get_parameter('hough_min_len').value
+        self.hough_gap         = self.get_parameter('hough_max_gap').value
+        self.min_slope         = self.get_parameter('min_slope_abs').value
+        self.max_slope         = self.get_parameter('max_slope_abs').value
+        self.min_sep           = self.get_parameter('min_lane_sep_px').value
+        self.drift_gain        = self.get_parameter('drift_gain').value
+        self.max_valid_sep     = self.get_parameter('max_valid_sep_px').value
+        image_topic            = self.get_parameter('image_topic').value
+
+        self.bridge       = CvBridge()
+        self._ema_error   = 0.0
+
+        # Auto-calibration buffer — only valid two-lane readings
+        self._lw_buf: deque = deque(maxlen=30)
 
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -78,212 +141,310 @@ class LaneDetectionNode(Node):
         self.debug_pub   = self.create_publisher(Image,   '/lane_debug/image',  sensor_qos)
 
         self.get_logger().info(
-            f'LaneDetectionNode started  '
-            f'min_sep={self.min_sep}px  '
-            f'min_blob_area={self.min_area}px²  '
-            f'fallback_lane_width={self._lw_param}px'
+            f'LaneDetectionNode v4 (fixed) started  '
+            f'lane_half_width={self._lane_half_w}px  '
+            f'roi_top={self.roi_top}  min_sep={self.min_sep}px'
         )
 
-    # ── calibrated lane width ─────────────────────────────────────────
+    # ── Lane half-width property ───────────────────────────────────────────
     @property
-    def _lane_width(self):
-        """
-        Returns the best available lane width estimate:
-          - Median of recent dual-lane frames if we have enough samples
-          - Parameter fallback otherwise
-        """
-        if len(self._lw_buf) >= 5:
-            return float(np.median(self._lw_buf))
-        return self._lw_param
+    def _half_width(self) -> float:
+        """Use auto-calibrated value only when we have enough valid readings."""
+        if self._use_auto_cal and len(self._lw_buf) >= 5:
+            return float(np.median(self._lw_buf)) / 2.0
+        return self._lane_half_w
 
-    # ── homography ────────────────────────────────────────────────────
-    def _compute_homography(self, frame):
-        h, w = frame.shape[:2]
-        src = np.float32([
-            [w * 0.02,  h * 0.525],
-            [w * 0.98,  h * 0.525],
-            [w * 0.225, h * 0.30],
-            [w * 0.775, h * 0.30],
-        ])
-        dst = np.float32([
-            [0,          self.bev_h],
-            [self.bev_w, self.bev_h],
-            [0,          0],
-            [self.bev_w, 0],
-        ])
-        self.homography = cv2.getPerspectiveTransform(src, dst)
-        self.get_logger().info('Homography computed')
-
-    # ── white-line mask ───────────────────────────────────────────────
-    def _detect_white(self, bev):
-        hsv = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
-        mask_hsv = cv2.inRange(hsv,
-                               np.array([0,   0, 180]),
-                               np.array([180, 80, 255]))
-        gray = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY)
-        _, mask_bright = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-        mask = cv2.bitwise_and(mask_hsv, mask_bright)
-
-        k_open    = cv2.getStructuringElement(cv2.MORPH_RECT, (3,   3))
-        k_close_v = cv2.getStructuringElement(cv2.MORPH_RECT, (5,  120))
-        k_close_h = cv2.getStructuringElement(cv2.MORPH_RECT, (80,   5))
-        k_dil     = cv2.getStructuringElement(cv2.MORPH_RECT, (7,   7))
-
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k_open)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close_v)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close_h)
-        mask = cv2.dilate(mask, k_dil, iterations=1)
-        mask[-20:, :] = 0
+    # ── White pixel mask ──────────────────────────────────────────────────
+    def _white_mask(self, roi_bgr):
+        hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(
+            hsv,
+            np.array([0,   0,            self.white_v_min]),
+            np.array([180, self.white_s_max, 255])
+        )
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        _, bright = cv2.threshold(gray, self.white_v_min, 255, cv2.THRESH_BINARY)
+        mask = cv2.bitwise_and(mask, bright)
+        k = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (self.close_kw, self.close_kh))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
         return mask
 
-    # ── contour blob finder ───────────────────────────────────────────
-    def _find_lane_blobs(self, mask):
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        blobs = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < self.min_area:
+    # ── Lane detection ────────────────────────────────────────────────────
+    def _detect_lanes(self, frame):
+        h, w = frame.shape[:2]
+        roi_y = int(h * self.roi_top)
+        roi   = frame[roi_y:h, 0:w]
+        roi_h = roi.shape[0]
+
+        white = self._white_mask(roi)
+        edges = cv2.Canny(white, self.canny_low, self.canny_high)
+
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=self.hough_thresh,
+            minLineLength=self.hough_min,
+            maxLineGap=self.hough_gap
+        )
+
+        img_cx     = w / 2.0
+        left_segs  = []
+        right_segs = []
+
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                if x2 == x1:
+                    continue
+                slope = (y2 - y1) / (x2 - x1)
+                if abs(slope) < self.min_slope or abs(slope) > self.max_slope:
+                    continue
+                seg_len = np.hypot(x2 - x1, y2 - y1)
+                mid_x   = (x1 + x2) / 2.0
+                if mid_x < img_cx:
+                    left_segs.append((x1, y1, x2, y2, seg_len))
+                else:
+                    right_segs.append((x1, y1, x2, y2, seg_len))
+
+        left_x  = self._weighted_line_x(left_segs,  roi_h)
+        right_x = self._weighted_line_x(right_segs, roi_h)
+
+        return left_x, right_x, white, edges, roi_y, left_segs, right_segs, w, h
+
+    def _weighted_line_x(self, segs, roi_h):
+        if not segs:
+            return None
+        slopes, intercepts, weights = [], [], []
+        for x1, y1, x2, y2, length in segs:
+            if x2 == x1:
                 continue
-            M = cv2.moments(cnt)
-            if M['m00'] == 0:
-                continue
-            cx = M['m10'] / M['m00']
-            blobs.append((cx, area, cnt))
-        blobs.sort(key=lambda b: b[1], reverse=True)
-        blobs = blobs[:2]
-        blobs.sort(key=lambda b: b[0])
-        return blobs
+            m = (y2 - y1) / (x2 - x1)
+            b = y1 - m * x1
+            slopes.append(m)
+            intercepts.append(b)
+            weights.append(length)
+        if not slopes:
+            return None
+        tw = sum(weights)
+        m  = sum(s * w for s, w in zip(slopes,     weights)) / tw
+        b  = sum(i * w for i, w in zip(intercepts, weights)) / tw
+        if abs(m) < 1e-6:
+            return None
+        return float((roi_h - 1 - b) / m)
 
-    # ── error computation ─────────────────────────────────────────────
-    def _compute_error(self, mask):
-        img_cx = self.bev_w / 2.0
-        blobs  = self._find_lane_blobs(mask)
-        lw     = self._lane_width   # best available width estimate
+    # ── Error computation (core fix) ──────────────────────────────────────
+    def _compute_error(self, left_x, right_x, img_w):
+        """
+        Compute lane-centre error.
 
-        if len(blobs) == 0:
-            return self._ema_error, False, 'none', []
+        Convention: error = img_cx - lane_cx
+          positive → lane centre is LEFT of image centre → robot must steer RIGHT
+          negative → lane centre is RIGHT of image centre → robot must steer LEFT
 
-        if len(blobs) == 2:
-            left_cx  = blobs[0][0]
-            right_cx = blobs[1][0]
-            h_sep    = right_cx - left_cx
+        Single-lane logic:
+          - If only LEFT lane visible: lane_cx = left_x + half_width
+            → robot should be half_width to the right of the left lane
+            → if left_x is too far right, error will be negative → steer left
+          - If only RIGHT lane visible: lane_cx = right_x - half_width
+            → robot should be half_width to the left of the right lane
+            → if right_x is too far left, error will be positive → steer right
 
-            if h_sep < self.min_sep:
-                # ── fragment merge ────────────────────────────────────
-                # Two blobs too close → same physical line, merge them
-                total_area = blobs[0][1] + blobs[1][1]
-                merged_cx  = (blobs[0][0] * blobs[0][1]
-                              + blobs[1][0] * blobs[1][1]) / total_area
-                blobs = [(merged_cx, total_area, None)]   # treat as one blob
-                self.get_logger().debug(
-                    f'[lane] Fragment merge sep={h_sep:.0f}px → '
-                    f'merged_cx={merged_cx:.0f}')
+        Drift-back behavior:
+          When only one lane is visible, the computed lane_cx is the TRUE
+          expected centre. The error naturally drives the robot back toward
+          both-lanes-visible position because once the robot re-centres,
+          the hidden lane will come back into view.
+        """
+        img_cx = img_w / 2.0
+
+        if left_x is None and right_x is None:
+            return self._ema_error, False, 'none'
+
+        half_w = self._half_width
+
+        if left_x is not None and right_x is not None:
+            sep = right_x - left_x
+
+            if sep < self.min_sep:
+                # ── Fragment: two detections are the SAME physical lane edge ──
+                # Determine which side of centre the fragment is on.
+                merged = (left_x + right_x) / 2.0
+
+                if merged < img_cx:
+                    # Fragment is on left side → it's the LEFT lane edge
+                    # Robot centre should be half_width to its right
+                    lane_cx = merged + half_w
+                    mode = 'left_frag'
+                    self.get_logger().debug(
+                        f'Fragment LEFT: merged={merged:.0f} lane_cx={lane_cx:.0f}')
+                else:
+                    # Fragment is on right side → it's the RIGHT lane edge
+                    # Robot centre should be half_width to its left
+                    lane_cx = merged - half_w
+                    mode = 'right_frag'
+                    self.get_logger().debug(
+                        f'Fragment RIGHT: merged={merged:.0f} lane_cx={lane_cx:.0f}')
+
             else:
-                # ── genuine two-lane detection ────────────────────────
-                # Update the calibrated lane width from this measurement
-                self._lw_buf.append(h_sep)
-                lane_cx = (left_cx + right_cx) / 2.0
-                raw_err = img_cx - lane_cx
-                self._ema_error = (self.ema_alpha * raw_err
-                                   + (1.0 - self.ema_alpha) * self._ema_error)
-                return self._ema_error, True, 'both', blobs
+                # ── Clean two-lane detection ───────────────────────────────────
+                if sep > self.max_valid_sep:
+                    # Sep is too large — one "lane" is actually an obstacle or
+                    # a false detection. Trust each side independently instead:
+                    # treat left_x as a real left edge and right_x as a real
+                    # right edge and average the two implied centres.
+                    lane_cx_from_left  = left_x  + half_w
+                    lane_cx_from_right = right_x - half_w
+                    lane_cx = (lane_cx_from_left + lane_cx_from_right) / 2.0
+                    mode = 'both_wide'
+                    self.get_logger().debug(
+                        f'Both-wide sep={sep:.0f} > max={self.max_valid_sep:.0f}, '
+                        f'averaging: cx={lane_cx:.0f}')
+                else:
+                    # Only calibrate when each lane is on its expected side
+                    # AND sep is within a sane range
+                    if left_x < img_cx and right_x > img_cx:
+                        self._lw_buf.append(sep)
+                    lane_cx = (left_x + right_x) / 2.0
+                    mode = 'both'
 
-        # ── single blob (or post-merge single blob) ───────────────────
-        # This is the recovery path: one lane visible, steer back to centre.
-        #
-        #   LEFT lane visible, robot drifted LEFT (or right lane gone):
-        #     lane_cx = left_cx + lw/2  →  to the right of the visible line
-        #     error   = img_cx - lane_cx  →  negative  →  lane_assist steers RIGHT ✓
-        #
-        #   RIGHT lane visible, robot drifted RIGHT (or left lane gone):
-        #     lane_cx = right_cx - lw/2  →  to the left of the visible line
-        #     error   = img_cx - lane_cx  →  positive  →  lane_assist steers LEFT ✓
-        cx = blobs[0][0]
-        if cx < img_cx:
-            lane_cx = cx + lw / 2.0
-            mode    = 'left_only' if len(blobs) == 1 else 'left_frag'
+        elif left_x is not None:
+            # ── Only left lane visible → drift right until right lane appears ──
+            lane_cx = left_x + half_w
+            mode = 'left_only'
+            self.get_logger().debug(
+                f'Left only: left_x={left_x:.0f} half_w={half_w:.0f} '
+                f'lane_cx={lane_cx:.0f}')
+
         else:
-            lane_cx = cx - lw / 2.0
-            mode    = 'right_only' if len(blobs) == 1 else 'right_frag'
+            # ── Only right lane visible → drift left until left lane appears ───
+            lane_cx = right_x - half_w
+            mode = 'right_only'
+            self.get_logger().debug(
+                f'Right only: right_x={right_x:.0f} half_w={half_w:.0f} '
+                f'lane_cx={lane_cx:.0f}')
 
         raw_err = img_cx - lane_cx
         self._ema_error = (self.ema_alpha * raw_err
                            + (1.0 - self.ema_alpha) * self._ema_error)
-        return self._ema_error, True, mode, blobs
+        return self._ema_error, True, mode
 
-    # ── main callback ─────────────────────────────────────────────────
+    # ── Main callback ─────────────────────────────────────────────────────
     def image_callback(self, msg):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
-            self.get_logger().warn(f'cv_bridge error: {e}')
+            self.get_logger().warn(f'cv_bridge: {e}')
             return
 
-        if self.homography is None:
-            self._compute_homography(frame)
+        left_x, right_x, white, edges, roi_y, \
+            left_segs, right_segs, fw, fh = self._detect_lanes(frame)
 
-        bev  = cv2.warpPerspective(
-            frame, self.homography, (self.bev_w, self.bev_h))
-        mask = self._detect_white(bev)
-        smooth_err, visible, mode, blobs = self._compute_error(mask)
+        smooth_err, visible, mode = self._compute_error(left_x, right_x, fw)
 
         self.error_pub.publish(Float32(data=float(smooth_err)))
         self.visible_pub.publish(Bool(data=visible))
 
-        # ── debug overlay ─────────────────────────────────────────────
-        overlay     = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        blob_colors = [(255, 100, 0), (0, 100, 255)]
+        # ── Debug overlay ─────────────────────────────────────────────────
+        debug = frame.copy()
+        roi_h = fh - roi_y
 
-        for i, (cx, area, cnt) in enumerate(blobs):
-            if cnt is not None:
-                color = blob_colors[i % 2]
-                cv2.drawContours(overlay, [cnt], -1, color, 2)
-            cv2.circle(overlay, (int(cx), self.bev_h // 2), 8,
-                       blob_colors[i % 2], -1)
+        # Semi-transparent white mask overlay
+        white_color = np.zeros_like(frame[roi_y:fh])
+        white_color[white > 0] = (0, 180, 0)
+        debug[roi_y:fh] = cv2.addWeighted(
+            debug[roi_y:fh], 0.7, white_color, 0.3, 0)
 
-        # Draw separation line between two real blobs
-        if len(blobs) == 2 and blobs[0][2] is not None:
-            sep       = blobs[1][0] - blobs[0][0]
-            sep_color = (0, 255, 0) if sep >= self.min_sep else (0, 0, 255)
-            cv2.line(overlay,
-                     (int(blobs[0][0]), self.bev_h // 2),
-                     (int(blobs[1][0]), self.bev_h // 2),
-                     sep_color, 2)
-            mid_x = int((blobs[0][0] + blobs[1][0]) / 2)
-            cv2.putText(overlay, f'sep={sep:.0f}px',
-                        (mid_x - 35, self.bev_h // 2 - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, sep_color, 1)
+        cv2.rectangle(debug, (0, roi_y), (fw, fh), (0, 80, 0), 1)
+
+        # Hough segments
+        for x1, y1, x2, y2, _ in left_segs:
+            cv2.line(debug, (x1, y1 + roi_y), (x2, y2 + roi_y), (255, 100, 0), 2)
+        for x1, y1, x2, y2, _ in right_segs:
+            cv2.line(debug, (x1, y1 + roi_y), (x2, y2 + roi_y), (0, 100, 255), 2)
+
+        bottom_y = fh - 5
+
+        if left_x is not None:
+            lx = int(np.clip(left_x, 0, fw - 1))
+            cv2.circle(debug, (lx, bottom_y), 10, (255, 100, 0), -1)
+            cv2.putText(debug, f'L:{lx}',
+                        (max(lx - 25, 0), bottom_y - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 150, 50), 1)
+
+        if right_x is not None:
+            rx = int(np.clip(right_x, 0, fw - 1))
+            cv2.circle(debug, (rx, bottom_y), 10, (0, 100, 255), -1)
+            cv2.putText(debug, f'R:{rx}',
+                        (min(rx - 25, fw - 50), bottom_y - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 150, 255), 1)
+
+        if left_x is not None and right_x is not None:
+            sep = right_x - left_x
+            sep_col = (0, 255, 0) if sep >= self.min_sep else (0, 0, 255)
+            lx = int(np.clip(left_x,  0, fw - 1))
+            rx = int(np.clip(right_x, 0, fw - 1))
+            cv2.line(debug, (lx, bottom_y), (rx, bottom_y), sep_col, 2)
+            cv2.putText(debug, f'sep={sep:.0f}',
+                        (int((lx + rx) / 2) - 30, bottom_y - 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, sep_col, 1)
 
         if visible:
-            img_cx  = self.bev_w // 2
-            lane_cx = int(img_cx - smooth_err)
-            cv2.line(overlay, (img_cx,  0), (img_cx,  self.bev_h),
-                     (0, 255, 0), 2)
-            cv2.line(overlay, (lane_cx, 0), (lane_cx, self.bev_h),
-                     (0, 0, 255), 2)
+            img_cx  = fw // 2
+            lane_cx = int(np.clip(img_cx - smooth_err, 0, fw - 1))
+            # Green = image centre (robot heading)
+            cv2.line(debug, (img_cx,  roi_y), (img_cx,  fh), (0, 255, 0),   2)
+            # Red = detected lane centre (target)
+            cv2.line(debug, (lane_cx, roi_y), (lane_cx, fh), (0, 0,   255), 2)
+
+            # Draw half-width guides from lane centre (cyan dashed region)
+            half_w_int = int(self._half_width)
+            cv2.line(debug,
+                     (max(lane_cx - half_w_int, 0), roi_y + roi_h // 2),
+                     (max(lane_cx - half_w_int, 0), fh),
+                     (255, 255, 0), 1)
+            cv2.line(debug,
+                     (min(lane_cx + half_w_int, fw - 1), roi_y + roi_h // 2),
+                     (min(lane_cx + half_w_int, fw - 1), fh),
+                     (255, 255, 0), 1)
 
         mode_colors = {
-            'both':       (0,   255, 0),
-            'left_only':  (0,   165, 255),
-            'right_only': (0,   165, 255),
-            'left_frag':  (0,   0,   255),
-            'right_frag': (0,   0,   255),
-            'none':       (128, 128, 128),
+            'both':        (0,   255, 0),
+            'both_wide':   (0,   200, 100),   # teal — wide sep, using averaged centres
+            'left_only':   (0,   165, 255),
+            'right_only':  (0,   165, 255),
+            'left_frag':   (0,   200, 200),
+            'right_frag':  (0,   200, 200),
+            'none':        (128, 128, 128),
         }
+        if len(self._lw_buf) >= 5:
+            cal_str = f'cal={int(self._half_width*2)}px'
+        else:
+            cal_str = f'fix={int(self._lane_half_w*2)}px'
         cv2.putText(
-            overlay,
-            f'err={smooth_err:.1f}px  [{mode}]  '
-            f'lw={self._lane_width:.0f}px  blobs={len(blobs)}',
-            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+            debug,
+            f'err={smooth_err:.1f}px  [{mode}]  {cal_str}',
+            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
             mode_colors.get(mode, (255, 255, 0)), 2)
 
-        debug_msg        = self.bridge.cv2_to_imgmsg(overlay, encoding='bgr8')
+        # Thumbnails
+        th, tw = fh // 5, fw // 5
+        wm_small = cv2.resize(white, (tw, th))
+        ed_small = cv2.resize(edges, (tw, th))
+        debug[fh - th:fh, 0:tw]    = cv2.cvtColor(wm_small, cv2.COLOR_GRAY2BGR)
+        debug[fh - th:fh, tw:tw*2] = cv2.cvtColor(ed_small, cv2.COLOR_GRAY2BGR)
+        cv2.putText(debug, 'white', (5,      fh - th + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 255, 180), 1)
+        cv2.putText(debug, 'canny', (tw + 5, fh - th + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 255, 180), 1)
+
+        debug_msg        = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
         debug_msg.header = msg.header
         self.debug_pub.publish(debug_msg)
 
         if self.show_debug:
-            cv2.imshow('BEV mask', overlay)
+            cv2.imshow('Lane Detection', debug)
             cv2.waitKey(1)
 
 

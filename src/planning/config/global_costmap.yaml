@@ -5,13 +5,17 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
 
-      update_frequency: 5.0
+      # CRITICAL FIX: 120x120m at 0.05 = 2400x2400 cells = too slow to update.
+      # Drums were showing as "free" because the costmap hadn't propagated yet.
+      # 40x40m at 0.05 = 800x800 cells — fast update, covers full track view.
+      update_frequency: 3.0
       publish_frequency: 2.0
 
       resolution: 0.05
       rolling_window: true
-      width: 100
-      height: 100
+      width: 40
+      height: 40
+
       track_unknown_space: true
 
       footprint: "[[0.25, 0.24], [0.25, -0.24], [-0.25, -0.24], [-0.25, 0.24]]"
@@ -21,16 +25,28 @@ global_costmap:
 
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
         observation_sources: scan
         scan:
           topic: /scan
+          data_type: LaserScan
           max_obstacle_height: 2.0
           min_obstacle_height: 0.05
           clearing: True
           marking: True
-          data_type: LaserScan
+          raytrace_min_range: 0.0
+          raytrace_max_range: 8.0
+          obstacle_min_range: 0.15
+          obstacle_max_range: 6.0
+          # Persist obstacles long enough that the global map stays accurate
+          # even when the drum briefly leaves the lidar FOV on a curve.
+          observation_persistence: 1.0
+          inf_is_valid: True
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.45
+        # Drums are ~0.2m radius. Robot is 0.25m half-width.
+        # 0.5m inflation = robot must stay 0.5m from drum centre edge.
+        # This forces Nav2 to route around the gap beside the drum, not through it.
+        inflation_radius: 0.5
         cost_scaling_factor: 2.5

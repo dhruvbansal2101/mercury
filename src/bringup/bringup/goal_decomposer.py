@@ -1,22 +1,24 @@
 """
-goal_decomposer_node.py
------------------------
-Intercepts large lateral goals and converts them into a smooth sequence
-of forward-biased waypoints sent to Nav2's FollowWaypoints action.
+goal_decomposer.py  (v5 — path-aware)
+--------------------------------------
+HOW PROFESSIONALS DO IT:
+  1. User sets a goal (RViz or terminal topic).
+  2. Ask Nav2's global planner (SMAC Hybrid-A*) to compute a
+     collision-free, curve-aware path that respects the costmap.
+  3. Sample waypoints every `path_sample_dist` metres along that path.
+  4. Navigate to each waypoint in sequence using /navigate_to_pose.
+  5. Gate-plane crossing (not Nav2 success) is the primary trigger to
+     advance — robot doesn't need to stop exactly at each waypoint.
+  6. If the planner fails (e.g. goal out of map), fall back to a
+     direct single-waypoint send so the robot still does something.
 
-Subscribe:  /goal_pose          (geometry_msgs/PoseStamped)  — from RViz / user
-Subscribe:  /odom               (nav_msgs/Odometry)          — current pose
-Action:     /follow_waypoints   (nav2_msgs/FollowWaypoints)  — Nav2 waypoint follower
-
-Logic:
-  1. When a goal arrives, compute lateral offset (perpendicular to current heading).
-  2. If lateral offset < lateral_threshold  →  send goal directly to Nav2 (passthrough).
-  3. If lateral offset ≥ lateral_threshold  →  decompose into N waypoints:
-       - Each waypoint is `forward_step` meters ahead of the previous one.
-       - Each waypoint shifts `lateral_step` meters toward the goal laterally.
-       - Final waypoint is the original goal.
-  This keeps the robot always moving forward, nudging sideways gradually,
-  so the lane never leaves the camera FOV.
+KEY FIXES over all previous versions:
+  - Uses /compute_path_to_pose (SMAC planner, not NavFn) for track-aware routing.
+  - dispatch_delay prevents instant status=6 cascade.
+  - _advancing flag prevents double-advance race condition.
+  - Accepts goals on /goal_pose AND /goal_decomposer/goal (for terminal use).
+  - Planner request retried once if first attempt returns empty path
+    (handles the case where the costmap hasn't finished building yet).
 """
 
 import math
@@ -24,10 +26,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Odometry
-from nav2_msgs.action import FollowWaypoints
-
-import tf_transformations  # from tf_transformations package
+from nav_msgs.msg import Odometry, Path
+from nav2_msgs.action import NavigateToPose, ComputePathToPose
+from std_msgs.msg import String
+import tf_transformations
 
 
 class GoalDecomposerNode(Node):
@@ -35,211 +37,356 @@ class GoalDecomposerNode(Node):
     def __init__(self):
         super().__init__('goal_decomposer_node')
 
-        # ── parameters ────────────────────────────────────────────────────
-        # If the goal's lateral offset (metres, perpendicular to robot heading)
-        # exceeds this, decompose it into waypoints.
-        self.declare_parameter('lateral_threshold', 0.8)
+        # ── Parameters ────────────────────────────────────────────────
+        self.declare_parameter('path_sample_dist',    1.5)
+        self.declare_parameter('gate_dist',           0.8)
+        self.declare_parameter('wp_timeout_sec',      25.0)
+        self.declare_parameter('min_goal_dist',       0.3)
+        self.declare_parameter('max_retries',         1)
+        self.declare_parameter('dispatch_delay_sec',  0.4)
+        # If planner fails, wait this long then retry planning once
+        self.declare_parameter('plan_retry_delay_sec', 3.0)
 
-        # Distance between consecutive intermediate waypoints (metres).
-        # Smaller = smoother path, more waypoints.
-        self.declare_parameter('forward_step', 0.6)
+        self.sample_dist       = self.get_parameter('path_sample_dist').value
+        self.gate_dist         = self.get_parameter('gate_dist').value
+        self.wp_timeout        = self.get_parameter('wp_timeout_sec').value
+        self.min_goal_dist     = self.get_parameter('min_goal_dist').value
+        self.max_retries       = int(self.get_parameter('max_retries').value)
+        self.dispatch_delay    = self.get_parameter('dispatch_delay_sec').value
+        self.plan_retry_delay  = self.get_parameter('plan_retry_delay_sec').value
 
-        # What fraction of remaining lateral error to close per waypoint.
-        # 0.3 = close 30% each step → gradual drift. Lower = more forward-biased.
-        self.declare_parameter('lateral_fraction', 0.3)
+        # ── State ─────────────────────────────────────────────────────
+        self.robot_x   = 0.0
+        self.robot_y   = 0.0
+        self.robot_yaw = 0.0
 
-        # Max number of intermediate waypoints to generate (safety cap).
-        self.declare_parameter('max_waypoints', 20)
+        self._waypoints:       list[PoseStamped] = []
+        self._wp_idx           = 0
+        self._navigating       = False
+        self._advancing        = False
+        self._retry_count      = 0
+        self._last_goal_xy     = None
+        self._wp_start_time    = None
+        self._pending_goal_msg = None   # stored while waiting for planner
+        self._plan_attempts    = 0
+        self._pending_dispatch = None   # (wp_idx, retry, wall_time)
 
-        self.lateral_threshold = self.get_parameter('lateral_threshold').value
-        self.forward_step      = self.get_parameter('forward_step').value
-        self.lateral_fraction  = self.get_parameter('lateral_fraction').value
-        self.max_waypoints     = self.get_parameter('max_waypoints').value
-
-        # ── state ─────────────────────────────────────────────────────────
-        self.current_x   = 0.0
-        self.current_y   = 0.0
-        self.current_yaw = 0.0
-
-        # ── subscribers ───────────────────────────────────────────────────
+        # ── Subscribers ───────────────────────────────────────────────
         self.create_subscription(
-            PoseStamped, '/goal_pose', self.goal_cb, 10)
+            PoseStamped, '/goal_pose', self._goal_cb, 10)
         self.create_subscription(
-            Odometry, '/diff_drive_controller/odom', self.odom_cb, 10)
+            PoseStamped, '/goal_decomposer/goal', self._goal_cb, 10)
+        self.create_subscription(
+            Odometry, '/diff_drive_controller/odom', self._odom_cb, 10)
 
-        # ── action client ─────────────────────────────────────────────────
-        self._waypoint_client = ActionClient(
-            self, FollowWaypoints, '/follow_waypoints')
+        # ── Publishers ────────────────────────────────────────────────
+        self._status_pub  = self.create_publisher(String, '/goal_decomposer/status', 5)
+        self._path_pub    = self.create_publisher(Path,   '/goal_decomposer/debug_path', 5)
+
+        # ── Action clients ────────────────────────────────────────────
+        self._plan_client = ActionClient(self, ComputePathToPose, '/compute_path_to_pose')
+        self._nav_client  = ActionClient(self, NavigateToPose,    '/navigate_to_pose')
+
+        # ── Timers ────────────────────────────────────────────────────
+        self.create_timer(0.1,  self._gate_check)
+        self.create_timer(0.05, self._dispatch_check)
 
         self.get_logger().info(
-            f'GoalDecomposerNode ready  '
-            f'lateral_threshold={self.lateral_threshold}m  '
-            f'forward_step={self.forward_step}m  '
-            f'lateral_fraction={self.lateral_fraction}')
+            f'GoalDecomposerNode v5 (path-aware)  '
+            f'sample={self.sample_dist}m  gate={self.gate_dist}m')
+        self.get_logger().info(
+            'Terminal goal: ros2 topic pub --once /goal_decomposer/goal '
+            'geometry_msgs/msg/PoseStamped '
+            '"{header: {frame_id: map}, pose: {position: {x: 26.0, y: -7.0, z: 0.0}, '
+            'orientation: {w: 1.0}}}"')
 
-    # ── odometry callback ─────────────────────────────────────────────────
-    def odom_cb(self, msg: Odometry):
-        self.current_x = msg.pose.pose.position.x
-        self.current_y = msg.pose.pose.position.y
+    # ── Odometry ──────────────────────────────────────────────────────
+    def _odom_cb(self, msg: Odometry):
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
-        _, _, self.current_yaw = tf_transformations.euler_from_quaternion(
+        _, _, self.robot_yaw = tf_transformations.euler_from_quaternion(
             [q.x, q.y, q.z, q.w])
 
-    # ── goal callback ─────────────────────────────────────────────────────
-    def goal_cb(self, msg: PoseStamped):
+    # ── Goal callback ─────────────────────────────────────────────────
+    def _goal_cb(self, msg: PoseStamped):
         gx = msg.pose.position.x
         gy = msg.pose.position.y
 
-        # Vector from robot to goal in world frame
-        dx = gx - self.current_x
-        dy = gy - self.current_y
+        if self._last_goal_xy is not None:
+            if math.hypot(gx - self._last_goal_xy[0],
+                          gy - self._last_goal_xy[1]) < self.min_goal_dist:
+                return
 
-        # Project onto robot's forward and lateral axes
-        forward_dist = dx * math.cos(self.current_yaw) + dy * math.sin(self.current_yaw)
-        lateral_dist = -dx * math.sin(self.current_yaw) + dy * math.cos(self.current_yaw)
-
+        self._last_goal_xy = (gx, gy)
+        dist = math.hypot(gx - self.robot_x, gy - self.robot_y)
         self.get_logger().info(
-            f'Goal received  forward={forward_dist:.2f}m  lateral={lateral_dist:.2f}m')
+            f'New goal ({gx:.2f}, {gy:.2f})  dist={dist:.2f}m  — requesting path...')
+        self._pub_status(f'planning to ({gx:.1f},{gy:.1f}) dist={dist:.1f}m')
 
-        if abs(lateral_dist) < self.lateral_threshold:
-            # Goal is roughly ahead — send directly as a single waypoint
-            self.get_logger().info('Goal within lateral threshold — sending directly')
-            self._send_waypoints([msg])
+        # Reset everything
+        self._reset_state()
+        self._pending_goal_msg = msg
+        self._plan_attempts    = 0
+
+        self._request_plan(msg)
+
+    def _reset_state(self):
+        self._waypoints.clear()
+        self._wp_idx          = 0
+        self._navigating      = False
+        self._advancing       = False
+        self._retry_count     = 0
+        self._pending_dispatch = None
+        self._wp_start_time   = None
+
+    # ── Planning ──────────────────────────────────────────────────────
+    def _request_plan(self, goal_pose: PoseStamped):
+        if not self._plan_client.wait_for_server(timeout_sec=3.0):
+            self.get_logger().warn(
+                '/compute_path_to_pose unavailable — falling back to direct nav')
+            self._fallback_direct(goal_pose)
             return
 
-        # ── Decompose into forward-biased waypoints ───────────────────────
-        waypoints = self._decompose(
-            self.current_x, self.current_y, self.current_yaw,
-            gx, gy, msg.pose.orientation, msg.header.frame_id)
+        plan_goal              = ComputePathToPose.Goal()
+        plan_goal.goal         = goal_pose
+        plan_goal.planner_id   = 'GridBased'
+        plan_goal.use_start    = False
 
+        self._plan_attempts += 1
         self.get_logger().info(
-            f'Decomposed into {len(waypoints)} waypoints  '
-            f'lateral={lateral_dist:.2f}m')
+            f'Requesting path (attempt {self._plan_attempts})...')
 
-        self._send_waypoints(waypoints)
+        fut = self._plan_client.send_goal_async(plan_goal)
+        fut.add_done_callback(self._plan_response_cb)
 
-    # ── decomposition logic ───────────────────────────────────────────────
-    def _decompose(self, rx, ry, ryaw, gx, gy, goal_orientation, frame_id):
-        """
-        Build a list of PoseStamped waypoints from (rx,ry) to (gx,gy).
-
-        Strategy:
-          - Start at current robot position.
-          - Each step: move `forward_step` meters forward in current heading,
-            then close `lateral_fraction` of remaining lateral error.
-          - Stop generating intermediates once we're within `forward_step`
-            of the goal, then append the exact goal as the final waypoint.
-        """
-        waypoints = []
-        stamp     = self.get_clock().now().to_msg()
-
-        # Running position (starts at robot)
-        wx, wy  = rx, ry
-        wyaw    = ryaw
-
-        for _ in range(self.max_waypoints - 1):
-            # Remaining vector to goal
-            dx = gx - wx
-            dy = gy - wy
-            dist_to_goal = math.hypot(dx, dy)
-
-            if dist_to_goal < self.forward_step:
-                break   # Close enough — final waypoint will be the exact goal
-
-            # Remaining lateral error (in robot-local frame at current wp)
-            lateral_remaining = (
-                -dx * math.sin(wyaw) + dy * math.cos(wyaw))
-
-            # Step forward along current heading
-            nx = wx + self.forward_step * math.cos(wyaw)
-            ny = wy + self.forward_step * math.sin(wyaw)
-
-            # Nudge laterally by a fraction of remaining lateral error
-            lateral_nudge = lateral_remaining * self.lateral_fraction
-            nx += lateral_nudge * (-math.sin(wyaw))   # lateral axis = -sin, cos
-            ny += lateral_nudge * math.cos(wyaw)
-
-            # Heading at this waypoint: point toward the next goal direction
-            # (blend current yaw with direction-to-goal for smooth turning)
-            angle_to_goal = math.atan2(gy - ny, gx - nx)
-            # Interpolate: 70% keep current heading, 30% toward goal
-            # This prevents sharp heading jumps between waypoints
-            wyaw = _angle_lerp(wyaw, angle_to_goal, 0.3)
-
-            wp = _make_pose(nx, ny, wyaw, frame_id, stamp)
-            waypoints.append(wp)
-
-            wx, wy = nx, ny
-
-        # Always append the exact original goal as the final waypoint
-        # (preserves the user's intended goal orientation)
-        final = PoseStamped()
-        final.header.frame_id = frame_id
-        final.header.stamp    = stamp
-        final.pose.position.x = gx
-        final.pose.position.y = gy
-        final.pose.position.z = 0.0
-        final.pose.orientation = goal_orientation
-        waypoints.append(final)
-
-        return waypoints
-
-    # ── action sender ─────────────────────────────────────────────────────
-    def _send_waypoints(self, waypoints: list):
-        if not self._waypoint_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().error(
-                '/follow_waypoints action server not available')
-            return
-
-        goal_msg            = FollowWaypoints.Goal()
-        goal_msg.poses      = waypoints
-
-        self.get_logger().info(
-            f'Sending {len(waypoints)} waypoint(s) to /follow_waypoints')
-
-        send_future = self._waypoint_client.send_goal_async(goal_msg)
-        send_future.add_done_callback(self._goal_response_cb)
-
-    def _goal_response_cb(self, future):
+    def _plan_response_cb(self, future):
         handle = future.result()
         if not handle.accepted:
-            self.get_logger().warn('Waypoint goal rejected by Nav2')
+            self.get_logger().warn('Plan request rejected')
+            self._handle_plan_failure()
             return
-        self.get_logger().info('Waypoint goal accepted')
-        handle.get_result_async().add_done_callback(self._result_cb)
+        handle.get_result_async().add_done_callback(self._plan_result_cb)
 
-    def _result_cb(self, future):
-        result = future.result().result
-        missed = result.missed_waypoints
-        if missed:
-            self.get_logger().warn(f'Missed waypoints: {missed}')
+    def _plan_result_cb(self, future):
+        result = future.result()
+        path   = result.result.path
+
+        if not path.poses:
+            self.get_logger().warn('Planner returned empty path')
+            self._handle_plan_failure()
+            return
+
+        self.get_logger().info(
+            f'Path received: {len(path.poses)} poses')
+
+        # Publish debug path to visualise in RViz
+        self._path_pub.publish(path)
+
+        # Sample waypoints along the path
+        self._waypoints = self._sample_path(path)
+        self.get_logger().info(
+            f'Sampled {len(self._waypoints)} waypoints  '
+            f'(every {self.sample_dist}m along planned path)')
+
+        self._pub_status(f'path OK → {len(self._waypoints)} waypoints')
+        self._schedule_dispatch(0, 0)
+
+    def _handle_plan_failure(self):
+        if self._plan_attempts < 2 and self._pending_goal_msg is not None:
+            # Retry once after delay (costmap may not be built yet)
+            self.get_logger().info(
+                f'Retrying plan in {self.plan_retry_delay}s...')
+            send_at = (self.get_clock().now().nanoseconds / 1e9
+                       + self.plan_retry_delay)
+            # Store as a special pending dispatch with negative index = plan retry
+            self._pending_dispatch = (-1, 0, send_at)
         else:
-            self.get_logger().info('All waypoints reached successfully')
+            self.get_logger().warn(
+                'Planning failed after retries — falling back to direct nav')
+            self._fallback_direct(self._pending_goal_msg)
 
+    def _fallback_direct(self, goal_pose: PoseStamped):
+        """Send the goal directly without waypoint decomposition."""
+        if goal_pose is None:
+            return
+        self.get_logger().warn('Fallback: sending goal directly to Nav2')
+        self._waypoints = [goal_pose]
+        self._schedule_dispatch(0, 0)
 
-# ── helpers ───────────────────────────────────────────────────────────────
+    # ── Path sampling ─────────────────────────────────────────────────
+    def _sample_path(self, path: Path) -> list[PoseStamped]:
+        """
+        Sample poses every `sample_dist` metres along the PLANNED path.
+        This preserves curves — waypoints follow the track shape, not
+        a straight line.
+        """
+        poses  = path.poses
+        result = []
+        accum  = 0.0
 
-def _angle_lerp(a, b, t):
-    """Interpolate between two angles, handling wrap-around."""
-    diff = math.atan2(math.sin(b - a), math.cos(b - a))
-    return a + t * diff
+        for i in range(1, len(poses)):
+            px = poses[i-1].pose.position.x
+            py = poses[i-1].pose.position.y
+            cx = poses[i].pose.position.x
+            cy = poses[i].pose.position.y
+            accum += math.hypot(cx - px, cy - py)
 
+            if accum >= self.sample_dist:
+                wp = PoseStamped()
+                wp.header         = poses[i].header
+                wp.pose           = poses[i].pose
+                result.append(wp)
+                accum = 0.0
 
-def _make_pose(x, y, yaw, frame_id, stamp):
-    """Build a PoseStamped from x, y, yaw."""
-    import tf_transformations
-    ps = PoseStamped()
-    ps.header.frame_id = frame_id
-    ps.header.stamp    = stamp
-    ps.pose.position.x = x
-    ps.pose.position.y = y
-    ps.pose.position.z = 0.0
-    q = tf_transformations.quaternion_from_euler(0.0, 0.0, yaw)
-    ps.pose.orientation.x = q[0]
-    ps.pose.orientation.y = q[1]
-    ps.pose.orientation.z = q[2]
-    ps.pose.orientation.w = q[3]
-    return ps
+        # Always include exact final goal pose
+        if poses:
+            final = PoseStamped()
+            final.header = poses[-1].header
+            final.pose   = poses[-1].pose
+            result.append(final)
+
+        return result
+
+    # ── Dispatch system ───────────────────────────────────────────────
+    def _schedule_dispatch(self, wp_idx: int, retry: int):
+        send_at = self.get_clock().now().nanoseconds / 1e9 + self.dispatch_delay
+        self._pending_dispatch = (wp_idx, retry, send_at)
+
+    def _dispatch_check(self):
+        if self._pending_dispatch is None:
+            return
+        wp_idx, retry, send_at = self._pending_dispatch
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now < send_at:
+            return
+
+        self._pending_dispatch = None
+
+        if wp_idx == -1:
+            # Plan retry
+            if self._pending_goal_msg is not None:
+                self._request_plan(self._pending_goal_msg)
+        else:
+            self._do_send_waypoint(wp_idx, retry)
+
+    # ── Navigation ────────────────────────────────────────────────────
+    def _do_send_waypoint(self, wp_idx: int, retry: int):
+        if not self._waypoints or wp_idx >= len(self._waypoints):
+            return
+
+        self._wp_idx      = wp_idx
+        self._retry_count = retry
+        self._advancing   = False
+
+        if not self._nav_client.wait_for_server(timeout_sec=3.0):
+            self.get_logger().error('/navigate_to_pose not available')
+            return
+
+        wp = self._waypoints[wp_idx]
+        self.get_logger().info(
+            f'→ wp {wp_idx + 1}/{len(self._waypoints)}: '
+            f'({wp.pose.position.x:.2f}, {wp.pose.position.y:.2f})  retry={retry}')
+        self._pub_status(
+            f'wp {wp_idx + 1}/{len(self._waypoints)} '
+            f'({wp.pose.position.x:.1f},{wp.pose.position.y:.1f})')
+
+        goal_msg      = NavigateToPose.Goal()
+        goal_msg.pose = wp
+
+        self._navigating    = True
+        self._wp_start_time = self.get_clock().now()
+
+        fut = self._nav_client.send_goal_async(goal_msg)
+        fut.add_done_callback(self._nav_response_cb)
+
+    def _nav_response_cb(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().warn(f'wp {self._wp_idx + 1} rejected')
+            self._on_wp_done(success=False)
+            return
+        handle.get_result_async().add_done_callback(self._nav_result_cb)
+
+    def _nav_result_cb(self, future):
+        result = future.result()
+        status = result.status   # 4=SUCCEEDED 5=CANCELED 6=ABORTED
+
+        if status == 5:
+            return   # intentionally canceled, ignore
+
+        self._navigating = False
+
+        if status == 4:
+            self.get_logger().info(f'Nav2 succeeded wp {self._wp_idx + 1}')
+            self._on_wp_done(success=True)
+        else:
+            self.get_logger().warn(
+                f'wp {self._wp_idx + 1} aborted  retry={self._retry_count}/{self.max_retries}')
+            if self._retry_count < self.max_retries:
+                self._schedule_dispatch(self._wp_idx, self._retry_count + 1)
+            else:
+                self.get_logger().warn(f'Skipping wp {self._wp_idx + 1}')
+                self._on_wp_done(success=False)
+
+    # ── Waypoint advancement ──────────────────────────────────────────
+    def _on_wp_done(self, success: bool):
+        if self._advancing:
+            return
+        self._advancing = True
+
+        next_idx = self._wp_idx + 1
+        if next_idx >= len(self._waypoints):
+            self.get_logger().info('All waypoints complete — mission done!')
+            self._pub_status('MISSION COMPLETE')
+            self._reset_state()
+        else:
+            self._schedule_dispatch(next_idx, 0)
+
+    # ── Gate check ────────────────────────────────────────────────────
+    def _gate_check(self):
+        if (not self._waypoints or
+                self._wp_idx >= len(self._waypoints) or
+                not self._navigating or
+                self._advancing):
+            return
+
+        wp  = self._waypoints[self._wp_idx]
+        wx  = wp.pose.position.x
+        wy  = wp.pose.position.y
+        q   = wp.pose.orientation
+        _, _, yaw = tf_transformations.euler_from_quaternion(
+            [q.x, q.y, q.z, q.w])
+
+        fwd_x  = math.cos(yaw)
+        fwd_y  = math.sin(yaw)
+        gate_x = wx - self.gate_dist * fwd_x
+        gate_y = wy - self.gate_dist * fwd_y
+
+        dot = ((self.robot_x - gate_x) * fwd_x +
+               (self.robot_y - gate_y) * fwd_y)
+
+        if dot >= 0:
+            self.get_logger().info(
+                f'Gate passed: wp {self._wp_idx + 1}/{len(self._waypoints)} '
+                f'({wx:.2f}, {wy:.2f})')
+            self._on_wp_done(success=True)
+            return
+
+        # Timeout
+        if self._wp_start_time is not None:
+            elapsed = (self.get_clock().now() -
+                       self._wp_start_time).nanoseconds / 1e9
+            if elapsed > self.wp_timeout:
+                self.get_logger().warn(
+                    f'wp {self._wp_idx + 1} timed out — skipping')
+                self._on_wp_done(success=False)
+
+    # ── Status ────────────────────────────────────────────────────────
+    def _pub_status(self, msg: str):
+        s = String()
+        s.data = msg
+        self._status_pub.publish(s)
 
 
 def main(args=None):

@@ -28,29 +28,16 @@ local_costmap:
           data_type: LaserScan
           max_obstacle_height: 2.0
           min_obstacle_height: 0.05
-          obstacle_min_range: 0.15
-          obstacle_max_range: 3.5       # reduced from 10 — far returns cause ghosts
-
-          # --- THE KEY FIXES FOR GHOST OBSTACLES ---
-
-          # How long (seconds) a marked cell persists even if not re-observed.
-          # 0.0 = cells are only kept while the sensor actively sees the obstacle.
-          # Was implicitly infinite before (default). Set to a short window so
-          # transient readings clear quickly.
+          obstacle_min_range: 0.2
+          obstacle_max_range: 5.0       # increased from 3.5 → marks obstacles earlier
           observation_persistence: 0.2
-
-          # Aggressively clear freespace using raytrace.
           clearing: True
           marking: True
           raytrace_min_range: 0.10
-          raytrace_max_range: 4.0       # slightly larger than obstacle_max_range
-
-          # Allow inf/nan returns to clear cells (lidar returns inf in open space).
+          raytrace_max_range: 5.5       # slightly beyond obstacle_max_range
           inf_is_valid: True
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # Reduced from 0.6 — 0.6 was bloating the path too much on the 3m wide track.
-        # 0.35 still provides clearance from the 0.5m wide robot footprint.
         inflation_radius: 0.35
         cost_scaling_factor: 3.0
