@@ -1,24 +1,51 @@
 """
-goal_decomposer.py  (v5 — path-aware)
---------------------------------------
-HOW PROFESSIONALS DO IT:
-  1. User sets a goal (RViz or terminal topic).
-  2. Ask Nav2's global planner (SMAC Hybrid-A*) to compute a
-     collision-free, curve-aware path that respects the costmap.
-  3. Sample waypoints every `path_sample_dist` metres along that path.
-  4. Navigate to each waypoint in sequence using /navigate_to_pose.
-  5. Gate-plane crossing (not Nav2 success) is the primary trigger to
-     advance — robot doesn't need to stop exactly at each waypoint.
-  6. If the planner fails (e.g. goal out of map), fall back to a
-     direct single-waypoint send so the robot still does something.
+goal_decomposer.py  (v7 — gate-only, no nav2 fighting)
+--------------------------------------------------------
+DESIGN PHILOSOPHY:
+  The decomposer does NOT fight Nav2's BT navigator.
+  It works by:
+    1. Receiving a goal (RViz /goal_pose or terminal /goal_decomposer/goal)
+    2. Computing a path with Nav2's planner
+    3. Sampling GATE PLANES every path_sample_dist metres along that path
+    4. Sending the FULL ORIGINAL GOAL to Nav2 navigate_to_pose ONCE
+    5. Monitoring robot position — when robot crosses a gate plane, mark WP done
+    6. When ALL gates are crossed, mission complete
 
-KEY FIXES over all previous versions:
-  - Uses /compute_path_to_pose (SMAC planner, not NavFn) for track-aware routing.
-  - dispatch_delay prevents instant status=6 cascade.
-  - _advancing flag prevents double-advance race condition.
-  - Accepts goals on /goal_pose AND /goal_decomposer/goal (for terminal use).
-  - Planner request retried once if first attempt returns empty path
-    (handles the case where the costmap hasn't finished building yet).
+  The key insight: we send ONE goal to Nav2 and let it drive the robot all the
+  way there. We only watch the robot's position against the gate planes.
+  We NEVER send sub-goals to Nav2 (no more fighting over the action server).
+
+GATE / FINISH-LINE LOGIC:
+  Each waypoint has a "gate plane" — an infinite line perpendicular to the
+  path direction at a point gate_dist metres BEFORE the waypoint.
+  The robot "passes" the waypoint when it crosses from behind to in front of
+  that gate plane (dot product crosses zero).
+
+  This means:
+  - The robot does NOT need to stop AT the waypoint
+  - The robot just needs to cross the imaginary finish line
+  - Works even if Nav2 routes slightly off the sampled path
+
+WAYPOINT PLACEMENT:
+  Waypoints are sampled along Nav2's planned path, so they ARE on the lane
+  centre (the path follows the costmap which is built from the track geometry).
+  If lane_detection is running, the robot will also be corrected to stay in
+  the lane centre via lane_assist_node.
+
+WHY (26,-7) FAILS:
+  NavFn fails with "Failed to create plan from potential" when:
+  1. The goal is in unknown/obstacle space in the costmap
+  2. The costmap hasn't seen that area yet (rolling window = only sees nearby)
+  Solution: The fallback now sends the goal DIRECTLY to Nav2 navigate_to_pose
+  which uses Nav2's internal replanning. Nav2's BT will keep trying to replan
+  as the costmap builds up as the robot moves forward.
+
+COMPLETE FIX SUMMARY:
+  - No more sub-goal sending → no more instant abort race condition
+  - Gate-plane crossing as primary WP completion trigger
+  - One Nav2 goal for the full mission
+  - Fallback to direct nav when planner fails (robot drives toward goal,
+    costmap builds, Nav2 replanns automatically)
 """
 
 import math
@@ -32,75 +59,116 @@ from std_msgs.msg import String
 import tf_transformations
 
 
+# ── Tiny helper: perpendicular-gate crossing test ─────────────────────────────
+def _crossed_gate(rx, ry, wp_x, wp_y, wp_yaw, gate_dist):
+    """
+    Returns True when the robot has crossed the gate plane.
+
+    Gate plane: a line perpendicular to the path at a point `gate_dist`
+    metres BEFORE (wp_x, wp_y) along the heading wp_yaw.
+
+        gate_point = (wp_x - gate_dist * cos(yaw),
+                      wp_y - gate_dist * sin(yaw))
+
+    Robot has crossed when the dot product of
+        (robot - gate_point) · forward_direction  >= 0
+    i.e. robot is on the far side of the gate line.
+    """
+    fwd_x  = math.cos(wp_yaw)
+    fwd_y  = math.sin(wp_yaw)
+    gate_x = wp_x - gate_dist * fwd_x
+    gate_y = wp_y - gate_dist * fwd_y
+    dot    = (rx - gate_x) * fwd_x + (ry - gate_y) * fwd_y
+    return dot >= 0.0
+
+
 class GoalDecomposerNode(Node):
 
     def __init__(self):
         super().__init__('goal_decomposer_node')
 
         # ── Parameters ────────────────────────────────────────────────
-        self.declare_parameter('path_sample_dist',    1.5)
-        self.declare_parameter('gate_dist',           0.8)
-        self.declare_parameter('wp_timeout_sec',      25.0)
-        self.declare_parameter('min_goal_dist',       0.3)
-        self.declare_parameter('max_retries',         1)
-        self.declare_parameter('dispatch_delay_sec',  0.4)
-        # If planner fails, wait this long then retry planning once
-        self.declare_parameter('plan_retry_delay_sec', 3.0)
+        # How far apart to place waypoint gate planes along the path (metres)
+        self.declare_parameter('path_sample_dist',    2.0)
 
-        self.sample_dist       = self.get_parameter('path_sample_dist').value
-        self.gate_dist         = self.get_parameter('gate_dist').value
-        self.wp_timeout        = self.get_parameter('wp_timeout_sec').value
-        self.min_goal_dist     = self.get_parameter('min_goal_dist').value
-        self.max_retries       = int(self.get_parameter('max_retries').value)
-        self.dispatch_delay    = self.get_parameter('dispatch_delay_sec').value
-        self.plan_retry_delay  = self.get_parameter('plan_retry_delay_sec').value
+        # Gate plane is this far BEFORE the waypoint centre (metres)
+        # Larger = robot triggers gate earlier. 0.5m is a narrow gate.
+        # 1.0m gives comfortable early trigger without false positives.
+        self.declare_parameter('gate_dist',           1.0)
 
-        # ── State ─────────────────────────────────────────────────────
+        # Reject new goals that are this close to the current goal (metres)
+        self.declare_parameter('min_goal_dist',       0.5)
+
+        # Seconds to wait between requesting plan and starting gate monitoring
+        self.declare_parameter('plan_retry_delay_sec', 4.0)
+
+        # How long to wait for Nav2 to finish cancelling before re-sending (s)
+        self.declare_parameter('nav2_settle_sec',      1.5)
+
+        self.sample_dist      = self.get_parameter('path_sample_dist').value
+        self.gate_dist        = self.get_parameter('gate_dist').value
+        self.min_goal_dist    = self.get_parameter('min_goal_dist').value
+        self.plan_retry_delay = self.get_parameter('plan_retry_delay_sec').value
+        self.nav2_settle      = self.get_parameter('nav2_settle_sec').value
+
+        # ── Robot pose ────────────────────────────────────────────────
         self.robot_x   = 0.0
         self.robot_y   = 0.0
         self.robot_yaw = 0.0
 
-        self._waypoints:       list[PoseStamped] = []
-        self._wp_idx           = 0
-        self._navigating       = False
-        self._advancing        = False
-        self._retry_count      = 0
-        self._last_goal_xy     = None
-        self._wp_start_time    = None
-        self._pending_goal_msg = None   # stored while waiting for planner
-        self._plan_attempts    = 0
-        self._pending_dispatch = None   # (wp_idx, retry, wall_time)
+        # ── Mission state ─────────────────────────────────────────────
+        # Each gate is: (wp_x, wp_y, wp_yaw, name, crossed:bool)
+        self._gates:         list[dict] = []
+        self._gate_idx       = 0           # next gate to watch for
+        self._mission_active = False
+        self._last_goal_xy   = None
+        self._current_goal   = None        # PoseStamped of full mission goal
+        self._plan_attempts  = 0
+        self._nav_handle     = None        # active Nav2 action handle
+        self._pending_nav_goal = None      # goal to send after settle delay
+        self._settle_until   = 0.0         # wall time to wait before re-sending
 
         # ── Subscribers ───────────────────────────────────────────────
         self.create_subscription(
-            PoseStamped, '/goal_pose', self._goal_cb, 10)
+            PoseStamped, '/goal_pose',
+            self._goal_cb, 10)
         self.create_subscription(
-            PoseStamped, '/goal_decomposer/goal', self._goal_cb, 10)
+            PoseStamped, '/goal_decomposer/goal',
+            self._goal_cb, 10)
         self.create_subscription(
-            Odometry, '/diff_drive_controller/odom', self._odom_cb, 10)
+            Odometry, '/diff_drive_controller/odom',
+            self._odom_cb, 10)
 
         # ── Publishers ────────────────────────────────────────────────
-        self._status_pub  = self.create_publisher(String, '/goal_decomposer/status', 5)
-        self._path_pub    = self.create_publisher(Path,   '/goal_decomposer/debug_path', 5)
+        self._status_pub = self.create_publisher(
+            String, '/goal_decomposer/status', 5)
+        self._path_pub   = self.create_publisher(
+            Path, '/goal_decomposer/debug_path', 5)
+        self._wp_pub     = self.create_publisher(
+            Path, '/goal_decomposer/waypoints', 5)  # gate centres for RViz
 
         # ── Action clients ────────────────────────────────────────────
-        self._plan_client = ActionClient(self, ComputePathToPose, '/compute_path_to_pose')
-        self._nav_client  = ActionClient(self, NavigateToPose,    '/navigate_to_pose')
+        self._plan_client = ActionClient(
+            self, ComputePathToPose, '/compute_path_to_pose')
+        self._nav_client  = ActionClient(
+            self, NavigateToPose, '/navigate_to_pose')
 
         # ── Timers ────────────────────────────────────────────────────
-        self.create_timer(0.1,  self._gate_check)
-        self.create_timer(0.05, self._dispatch_check)
+        self.create_timer(0.05, self._gate_monitor)   # 20 Hz gate check
+        self.create_timer(1.0,  self._status_timer)   # 1 Hz status log
 
         self.get_logger().info(
-            f'GoalDecomposerNode v5 (path-aware)  '
-            f'sample={self.sample_dist}m  gate={self.gate_dist}m')
+            f'GoalDecomposerNode v7  '
+            f'sample={self.sample_dist}m  gate_dist={self.gate_dist}m')
         self.get_logger().info(
-            'Terminal goal: ros2 topic pub --once /goal_decomposer/goal '
+            'Send goal: ros2 topic pub --once /goal_decomposer/goal '
             'geometry_msgs/msg/PoseStamped '
-            '"{header: {frame_id: map}, pose: {position: {x: 26.0, y: -7.0, z: 0.0}, '
+            '"{header: {frame_id: map}, pose: {position: {x: 26.0, y: -7.0}, '
             'orientation: {w: 1.0}}}"')
 
-    # ── Odometry ──────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────
+    # Odometry
+    # ─────────────────────────────────────────────────────────────────
     def _odom_cb(self, msg: Odometry):
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
@@ -108,11 +176,14 @@ class GoalDecomposerNode(Node):
         _, _, self.robot_yaw = tf_transformations.euler_from_quaternion(
             [q.x, q.y, q.z, q.w])
 
-    # ── Goal callback ─────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────
+    # Goal callback — called by RViz /goal_pose or terminal
+    # ─────────────────────────────────────────────────────────────────
     def _goal_cb(self, msg: PoseStamped):
         gx = msg.pose.position.x
         gy = msg.pose.position.y
 
+        # Deduplicate near-identical goals
         if self._last_goal_xy is not None:
             if math.hypot(gx - self._last_goal_xy[0],
                           gy - self._last_goal_xy[1]) < self.min_goal_dist:
@@ -120,42 +191,39 @@ class GoalDecomposerNode(Node):
 
         self._last_goal_xy = (gx, gy)
         dist = math.hypot(gx - self.robot_x, gy - self.robot_y)
+
         self.get_logger().info(
-            f'New goal ({gx:.2f}, {gy:.2f})  dist={dist:.2f}m  — requesting path...')
+            f'New goal ({gx:.2f}, {gy:.2f})  dist={dist:.2f}m')
         self._pub_status(f'planning to ({gx:.1f},{gy:.1f}) dist={dist:.1f}m')
 
-        # Reset everything
-        self._reset_state()
-        self._pending_goal_msg = msg
-        self._plan_attempts    = 0
+        # Cancel any running navigation cleanly
+        self._abort_mission()
+
+        self._current_goal  = msg
+        self._plan_attempts = 0
+        self._gates.clear()
+        self._gate_idx      = 0
 
         self._request_plan(msg)
 
-    def _reset_state(self):
-        self._waypoints.clear()
-        self._wp_idx          = 0
-        self._navigating      = False
-        self._advancing       = False
-        self._retry_count     = 0
-        self._pending_dispatch = None
-        self._wp_start_time   = None
-
-    # ── Planning ──────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────
+    # Planning
+    # ─────────────────────────────────────────────────────────────────
     def _request_plan(self, goal_pose: PoseStamped):
         if not self._plan_client.wait_for_server(timeout_sec=3.0):
             self.get_logger().warn(
-                '/compute_path_to_pose unavailable — falling back to direct nav')
-            self._fallback_direct(goal_pose)
+                'compute_path_to_pose unavailable — sending direct nav goal')
+            self._start_navigation(goal_pose)
             return
 
-        plan_goal              = ComputePathToPose.Goal()
-        plan_goal.goal         = goal_pose
-        plan_goal.planner_id   = 'GridBased'
-        plan_goal.use_start    = False
+        plan_goal            = ComputePathToPose.Goal()
+        plan_goal.goal       = goal_pose
+        plan_goal.planner_id = 'GridBased'   # matches planner_plugins key in nav2_params.yaml
+        plan_goal.use_start  = False
 
         self._plan_attempts += 1
         self.get_logger().info(
-            f'Requesting path (attempt {self._plan_attempts})...')
+            f'Requesting path from planner (attempt {self._plan_attempts})...')
 
         fut = self._plan_client.send_goal_async(plan_goal)
         fut.add_done_callback(self._plan_response_cb)
@@ -163,8 +231,8 @@ class GoalDecomposerNode(Node):
     def _plan_response_cb(self, future):
         handle = future.result()
         if not handle.accepted:
-            self.get_logger().warn('Plan request rejected')
-            self._handle_plan_failure()
+            self.get_logger().warn('Plan goal rejected')
+            self._on_plan_fail()
             return
         handle.get_result_async().add_done_callback(self._plan_result_cb)
 
@@ -173,218 +241,275 @@ class GoalDecomposerNode(Node):
         path   = result.result.path
 
         if not path.poses:
-            self.get_logger().warn('Planner returned empty path')
-            self._handle_plan_failure()
+            self.get_logger().warn('Planner returned empty / failed path')
+            self._on_plan_fail()
             return
 
         self.get_logger().info(
             f'Path received: {len(path.poses)} poses')
-
-        # Publish debug path to visualise in RViz
         self._path_pub.publish(path)
 
-        # Sample waypoints along the path
-        self._waypoints = self._sample_path(path)
+        # Build gate list from path
+        self._gates    = self._build_gates(path)
+        self._gate_idx = 0
+
         self.get_logger().info(
-            f'Sampled {len(self._waypoints)} waypoints  '
-            f'(every {self.sample_dist}m along planned path)')
+            f'Created {len(self._gates)} gate planes '
+            f'(every {self.sample_dist}m)')
 
-        self._pub_status(f'path OK → {len(self._waypoints)} waypoints')
-        self._schedule_dispatch(0, 0)
+        # Publish gate centres for RViz visualisation
+        self._pub_gates_as_path(path.header)
 
-    def _handle_plan_failure(self):
-        if self._plan_attempts < 2 and self._pending_goal_msg is not None:
-            # Retry once after delay (costmap may not be built yet)
+        # Now send ONE navigate_to_pose to the actual goal
+        self._start_navigation(self._current_goal)
+
+    def _on_plan_fail(self):
+        if self._plan_attempts < 2 and self._current_goal is not None:
+            delay = self.get_clock().now().nanoseconds / 1e9 + self.plan_retry_delay
             self.get_logger().info(
-                f'Retrying plan in {self.plan_retry_delay}s...')
-            send_at = (self.get_clock().now().nanoseconds / 1e9
-                       + self.plan_retry_delay)
-            # Store as a special pending dispatch with negative index = plan retry
-            self._pending_dispatch = (-1, 0, send_at)
-        else:
-            self.get_logger().warn(
-                'Planning failed after retries — falling back to direct nav')
-            self._fallback_direct(self._pending_goal_msg)
-
-    def _fallback_direct(self, goal_pose: PoseStamped):
-        """Send the goal directly without waypoint decomposition."""
-        if goal_pose is None:
+                f'Retrying plan in {self.plan_retry_delay:.1f}s...')
+            # Store retry time — checked in gate_monitor
+            self._settle_until     = delay
+            self._pending_nav_goal = None   # signal: retry plan, not nav
             return
-        self.get_logger().warn('Fallback: sending goal directly to Nav2')
-        self._waypoints = [goal_pose]
-        self._schedule_dispatch(0, 0)
 
-    # ── Path sampling ─────────────────────────────────────────────────
-    def _sample_path(self, path: Path) -> list[PoseStamped]:
+        # Give up planning — send direct nav and let Nav2 figure it out
+        # Nav2's BT will replan internally as costmap builds while driving
+        self.get_logger().warn(
+            'Planning failed after retries — sending goal directly to Nav2. '
+            'Nav2 will replan as map builds.')
+        self._gates    = []
+        self._gate_idx = 0
+        self._start_navigation(self._current_goal)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Gate building
+    # ─────────────────────────────────────────────────────────────────
+    def _build_gates(self, path: Path) -> list[dict]:
         """
-        Sample poses every `sample_dist` metres along the PLANNED path.
-        This preserves curves — waypoints follow the track shape, not
-        a straight line.
+        Sample gate planes every sample_dist metres along the planned path.
+        Each gate is perpendicular to the LOCAL path direction at that point.
+
+        The gate plane position is placed ON THE LANE CENTRE (the planner
+        path follows the lane centre in the costmap).
+
+        Returns list of dicts:
+            x, y    — gate centre (on the path = lane centre)
+            yaw     — local path heading at that point
+            name    — "WP-N"
+            crossed — False initially
         """
         poses  = path.poses
-        result = []
+        gates  = []
         accum  = 0.0
+        count  = 1
 
         for i in range(1, len(poses)):
             px = poses[i-1].pose.position.x
             py = poses[i-1].pose.position.y
             cx = poses[i].pose.position.x
             cy = poses[i].pose.position.y
-            accum += math.hypot(cx - px, cy - py)
+            seg = math.hypot(cx - px, cy - py)
+            accum += seg
 
             if accum >= self.sample_dist:
-                wp = PoseStamped()
-                wp.header         = poses[i].header
-                wp.pose           = poses[i].pose
-                result.append(wp)
+                # Compute local heading from this segment
+                yaw = math.atan2(cy - py, cx - px)
+                gates.append({
+                    'x':       cx,
+                    'y':       cy,
+                    'yaw':     yaw,
+                    'name':    f'WP-{count}',
+                    'crossed': False,
+                })
+                count += 1
                 accum = 0.0
 
-        # Always include exact final goal pose
+        # Final gate AT the goal
         if poses:
-            final = PoseStamped()
-            final.header = poses[-1].header
-            final.pose   = poses[-1].pose
-            result.append(final)
+            last  = poses[-1]
+            prev  = poses[-2] if len(poses) > 1 else poses[-1]
+            dx    = last.pose.position.x - prev.pose.position.x
+            dy    = last.pose.position.y - prev.pose.position.y
+            yaw   = math.atan2(dy, dx) if (dx != 0 or dy != 0) else 0.0
+            gates.append({
+                'x':       last.pose.position.x,
+                'y':       last.pose.position.y,
+                'yaw':     yaw,
+                'name':    f'WP-{count} (GOAL)',
+                'crossed': False,
+            })
 
-        return result
+        return gates
 
-    # ── Dispatch system ───────────────────────────────────────────────
-    def _schedule_dispatch(self, wp_idx: int, retry: int):
-        send_at = self.get_clock().now().nanoseconds / 1e9 + self.dispatch_delay
-        self._pending_dispatch = (wp_idx, retry, send_at)
+    def _pub_gates_as_path(self, header):
+        """Publish gate centres as a Path so they show in RViz."""
+        p = Path()
+        p.header = header
+        for g in self._gates:
+            ps = PoseStamped()
+            ps.header = header
+            ps.pose.position.x = g['x']
+            ps.pose.position.y = g['y']
+            ps.pose.position.z = 0.1   # slightly above ground for visibility
+            # Encode heading in orientation
+            import math
+            yaw = g['yaw']
+            ps.pose.orientation.z = math.sin(yaw / 2)
+            ps.pose.orientation.w = math.cos(yaw / 2)
+            p.poses.append(ps)
+        self._wp_pub.publish(p)
 
-    def _dispatch_check(self):
-        if self._pending_dispatch is None:
+    # ─────────────────────────────────────────────────────────────────
+    # Navigation — send ONE goal to Nav2
+    # ─────────────────────────────────────────────────────────────────
+    def _start_navigation(self, goal_pose: PoseStamped):
+        if goal_pose is None:
             return
-        wp_idx, retry, send_at = self._pending_dispatch
-        now = self.get_clock().now().nanoseconds / 1e9
-        if now < send_at:
-            return
-
-        self._pending_dispatch = None
-
-        if wp_idx == -1:
-            # Plan retry
-            if self._pending_goal_msg is not None:
-                self._request_plan(self._pending_goal_msg)
-        else:
-            self._do_send_waypoint(wp_idx, retry)
-
-    # ── Navigation ────────────────────────────────────────────────────
-    def _do_send_waypoint(self, wp_idx: int, retry: int):
-        if not self._waypoints or wp_idx >= len(self._waypoints):
-            return
-
-        self._wp_idx      = wp_idx
-        self._retry_count = retry
-        self._advancing   = False
 
         if not self._nav_client.wait_for_server(timeout_sec=3.0):
-            self.get_logger().error('/navigate_to_pose not available')
+            self.get_logger().error('/navigate_to_pose server not available')
             return
 
-        wp = self._waypoints[wp_idx]
+        gx = goal_pose.pose.position.x
+        gy = goal_pose.pose.position.y
         self.get_logger().info(
-            f'→ wp {wp_idx + 1}/{len(self._waypoints)}: '
-            f'({wp.pose.position.x:.2f}, {wp.pose.position.y:.2f})  retry={retry}')
+            f'Sending navigation goal to Nav2: ({gx:.2f}, {gy:.2f})')
         self._pub_status(
-            f'wp {wp_idx + 1}/{len(self._waypoints)} '
-            f'({wp.pose.position.x:.1f},{wp.pose.position.y:.1f})')
+            f'navigating to ({gx:.1f},{gy:.1f})  '
+            f'{len(self._gates)} gates to cross')
 
-        goal_msg      = NavigateToPose.Goal()
-        goal_msg.pose = wp
+        nav_goal      = NavigateToPose.Goal()
+        nav_goal.pose = goal_pose
 
-        self._navigating    = True
-        self._wp_start_time = self.get_clock().now()
-
-        fut = self._nav_client.send_goal_async(goal_msg)
+        self._mission_active = True
+        fut = self._nav_client.send_goal_async(nav_goal)
         fut.add_done_callback(self._nav_response_cb)
 
     def _nav_response_cb(self, future):
         handle = future.result()
         if not handle.accepted:
-            self.get_logger().warn(f'wp {self._wp_idx + 1} rejected')
-            self._on_wp_done(success=False)
+            self.get_logger().error(
+                'Nav2 rejected the navigation goal! '
+                'Is Nav2 lifecycle manager running?')
+            self._mission_active = False
             return
+        self._nav_handle = handle
+        self.get_logger().info('Nav2 accepted goal — monitoring gate crossings')
         handle.get_result_async().add_done_callback(self._nav_result_cb)
 
     def _nav_result_cb(self, future):
+        """Called when Nav2 finishes (success, abort, or cancel)."""
         result = future.result()
         status = result.status   # 4=SUCCEEDED 5=CANCELED 6=ABORTED
 
-        if status == 5:
-            return   # intentionally canceled, ignore
-
-        self._navigating = False
+        self._nav_handle     = None
+        self._mission_active = False
 
         if status == 4:
-            self.get_logger().info(f'Nav2 succeeded wp {self._wp_idx + 1}')
-            self._on_wp_done(success=True)
+            self.get_logger().info(
+                'Nav2 reached the goal — mission complete!')
+            self._pub_status('MISSION COMPLETE (Nav2 success)')
+            self._mark_all_gates_crossed()
+        elif status == 5:
+            self.get_logger().info('Nav2 goal canceled (new goal received)')
         else:
             self.get_logger().warn(
-                f'wp {self._wp_idx + 1} aborted  retry={self._retry_count}/{self.max_retries}')
-            if self._retry_count < self.max_retries:
-                self._schedule_dispatch(self._wp_idx, self._retry_count + 1)
-            else:
-                self.get_logger().warn(f'Skipping wp {self._wp_idx + 1}')
-                self._on_wp_done(success=False)
+                f'Nav2 aborted (status={status}). '
+                'Robot may be stuck or goal is unreachable. '
+                'Nav2 will have attempted recovery behaviours.')
+            self._pub_status(f'Nav2 ABORTED status={status}')
 
-    # ── Waypoint advancement ──────────────────────────────────────────
-    def _on_wp_done(self, success: bool):
-        if self._advancing:
-            return
-        self._advancing = True
+    # ─────────────────────────────────────────────────────────────────
+    # Gate monitoring — runs at 20 Hz
+    # ─────────────────────────────────────────────────────────────────
+    def _gate_monitor(self):
+        now = self.get_clock().now().nanoseconds / 1e9
 
-        next_idx = self._wp_idx + 1
-        if next_idx >= len(self._waypoints):
-            self.get_logger().info('All waypoints complete — mission done!')
-            self._pub_status('MISSION COMPLETE')
-            self._reset_state()
-        else:
-            self._schedule_dispatch(next_idx, 0)
-
-    # ── Gate check ────────────────────────────────────────────────────
-    def _gate_check(self):
-        if (not self._waypoints or
-                self._wp_idx >= len(self._waypoints) or
-                not self._navigating or
-                self._advancing):
+        # Handle plan retry timing
+        if (not self._mission_active
+                and self._settle_until > 0
+                and now >= self._settle_until
+                and self._current_goal is not None
+                and self._pending_nav_goal is None
+                and self._plan_attempts < 2):
+            self._settle_until = 0.0
+            self._request_plan(self._current_goal)
             return
 
-        wp  = self._waypoints[self._wp_idx]
-        wx  = wp.pose.position.x
-        wy  = wp.pose.position.y
-        q   = wp.pose.orientation
-        _, _, yaw = tf_transformations.euler_from_quaternion(
-            [q.x, q.y, q.z, q.w])
+        if not self._mission_active or not self._gates:
+            return
 
-        fwd_x  = math.cos(yaw)
-        fwd_y  = math.sin(yaw)
-        gate_x = wx - self.gate_dist * fwd_x
-        gate_y = wy - self.gate_dist * fwd_y
+        # Find the next uncrossed gate
+        while (self._gate_idx < len(self._gates)
+               and self._gates[self._gate_idx]['crossed']):
+            self._gate_idx += 1
 
-        dot = ((self.robot_x - gate_x) * fwd_x +
-               (self.robot_y - gate_y) * fwd_y)
-
-        if dot >= 0:
+        if self._gate_idx >= len(self._gates):
+            # All gates crossed
             self.get_logger().info(
-                f'Gate passed: wp {self._wp_idx + 1}/{len(self._waypoints)} '
-                f'({wx:.2f}, {wy:.2f})')
-            self._on_wp_done(success=True)
+                'All gate planes crossed — mission waypoints complete!')
+            self._pub_status('MISSION COMPLETE (all gates crossed)')
             return
 
-        # Timeout
-        if self._wp_start_time is not None:
-            elapsed = (self.get_clock().now() -
-                       self._wp_start_time).nanoseconds / 1e9
-            if elapsed > self.wp_timeout:
-                self.get_logger().warn(
-                    f'wp {self._wp_idx + 1} timed out — skipping')
-                self._on_wp_done(success=False)
+        g = self._gates[self._gate_idx]
 
-    # ── Status ────────────────────────────────────────────────────────
+        if _crossed_gate(
+                self.robot_x, self.robot_y,
+                g['x'], g['y'], g['yaw'],
+                self.gate_dist):
+
+            g['crossed'] = True
+            crossed_count = sum(1 for g2 in self._gates if g2['crossed'])
+            total         = len(self._gates)
+
+            self.get_logger().info(
+                f'✓ Gate crossed: {g["name"]}  '
+                f'({g["x"]:.2f}, {g["y"]:.2f})  '
+                f'[{crossed_count}/{total}]  '
+                f'robot=({self.robot_x:.2f}, {self.robot_y:.2f})')
+
+            self._pub_status(
+                f'gate {crossed_count}/{total}: {g["name"]} ✓')
+
+            self._gate_idx += 1
+
+    # ─────────────────────────────────────────────────────────────────
+    # Abort current mission cleanly
+    # ─────────────────────────────────────────────────────────────────
+    def _abort_mission(self):
+        self._mission_active = False
+        self._settle_until   = 0.0
+        if self._nav_handle is not None:
+            self.get_logger().info('Canceling current Nav2 goal...')
+            self._nav_handle.cancel_goal_async()
+            self._nav_handle = None
+
+    def _mark_all_gates_crossed(self):
+        for g in self._gates:
+            g['crossed'] = True
+        self._gate_idx = len(self._gates)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Status timer
+    # ─────────────────────────────────────────────────────────────────
+    def _status_timer(self):
+        if not self._mission_active:
+            return
+        crossed = sum(1 for g in self._gates if g['crossed'])
+        total   = len(self._gates)
+        nxt     = (self._gates[self._gate_idx]['name']
+                   if self._gate_idx < total else 'DONE')
+        self.get_logger().info(
+            f'[Mission] gates={crossed}/{total}  '
+            f'next={nxt}  '
+            f'robot=({self.robot_x:.2f}, {self.robot_y:.2f})')
+
+    # ─────────────────────────────────────────────────────────────────
+    # Status publisher
+    # ─────────────────────────────────────────────────────────────────
     def _pub_status(self, msg: str):
-        s = String()
+        s      = String()
         s.data = msg
         self._status_pub.publish(s)
 

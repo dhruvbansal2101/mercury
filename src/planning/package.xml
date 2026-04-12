@@ -3,16 +3,24 @@
 <package format="3">
   <name>planning</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Planning package for Mercury UGV</description>
   <maintainer email="dev@todo.todo">dev</maintainer>
-  <license>TODO: License declaration</license>
+  <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
-  <!-- <depend>nav2_msgs</depend> -->
   <depend>geometry_msgs</depend>
   <depend>tf2_ros</depend>
+
+  <depend>nav2_planner</depend>
+  <depend>nav2_controller</depend>
+  <depend>nav2_bt_navigator</depend>
+  <depend>nav2_behaviors</depend>
+  <depend>nav2_lifecycle_manager</depend>
+  <depend>nav2_navfn_planner</depend>
+  <depend>nav2_smac_planner</depend>
+  <depend>dwb_core</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
