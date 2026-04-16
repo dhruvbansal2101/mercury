@@ -1,8 +1,15 @@
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
+
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time', default_value='true'
+    )
+    use_sim = LaunchConfiguration('use_sim_time')
 
     lane_detection_node = Node(
         package='perception',
@@ -51,6 +58,65 @@ def generate_launch_description():
         }]
     )
 
+    lane_costmap = Node(
+        package='perception',
+        executable='lane_costmap',
+        name='lane_costmap',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+
+            # ── Map extent — must match global_costmap.yaml ──────────────
+            'map_width_m':    70.0,
+            'map_height_m':   70.0,
+            'resolution':      0.10,   # 0.10 m/cell → 700×700 grid
+            'map_origin_x':  -35.0,
+            'map_origin_y':  -35.0,
+
+            # ── Camera sensor (matches URDF robot_sensors.xacro) ─────────
+            'camera_hfov':   1.047,    # rad  (from sensor config)
+            'image_width':   640,
+            'image_height':  480,
+
+            # ── Detection tuning ─────────────────────────────────────────
+            'roi_top_frac':  0.35,     # ignore top 35% (sky, far distance)
+            'sample_rows':   8,        # rows to project per frame
+            'white_v_min':   170,      # HSV value threshold for white lanes
+            'white_s_max':   60,       # HSV saturation threshold
+
+            # ── Projection extent ─────────────────────────────────────────
+            # Pixels projected outside each boundary → marked lethal (100).
+            # 48 px × ~0.005 m/px (close range) ≈ 0.25 m outside the line.
+            'obstacle_pixels_outside': 48,
+            # Pixels projected inside boundary → confirmed free (0).
+            'free_pixels_inside':      32,
+
+            # ── Performance ───────────────────────────────────────────────
+            'publish_rate':    5.0,    # Hz  (StaticLayer re-reads each update)
+            'process_every_n': 3,      # process 1-in-3 camera frames (~10 Hz)
+        }]
+    )
+
+     # ── Lane assist node ───────────────────────────────────────────────────
+    lane_assist = Node(
+        package='perception',
+        executable='lane_assist_node',
+        name='lane_assist_node',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+            'Kp': 0.18,
+            'Kd': 0.08,
+            'max_correction': 0.3,
+            'image_half_width': 320.0,
+            'dead_band_px': 25.0,
+            'timeout_sec': 0.5,
+        }]
+    )
+
     return LaunchDescription([
+        use_sim_time_arg,
         lane_detection_node,
+        lane_costmap,
+        lane_assist,
     ])

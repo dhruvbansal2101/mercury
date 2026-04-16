@@ -33,6 +33,7 @@ setup(
             # NEW: lightweight detection node that feeds lane_assist_node
             'lane_detection = perception.lane_detection:main',
             'lane_costmap = perception.lane_costmap_node:main',
+            'lane_assist_node = perception.lane_assist_node:main',
         ],
     },
 )

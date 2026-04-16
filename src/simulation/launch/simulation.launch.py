@@ -41,9 +41,12 @@ def generate_launch_description():
 
     return LaunchDescription([
 
+        SetEnvironmentVariable('GZ_IP', '127.0.0.1'),
+
         SetEnvironmentVariable(
             'GZ_SIM_RESOURCE_PATH',
-            os.path.join(pkg_sim, 'models') + ':' + os.path.join(pkg_sim, 'models', 'images')
+            os.path.join(pkg_sim, 'models') + ':' + os.path.join(pkg_sim, 'models', 'images'),
+
         ),
         ExecuteProcess(
             cmd=['gz', 'sim', '-r', world_file],
