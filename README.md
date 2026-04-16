@@ -1,4 +1,5 @@
 # mercury  
+
 Official repository for **ICMTC UGVC-2026**
 
 ---
@@ -133,8 +134,8 @@ To manually move the turret, publish commands to the controller:
 ros2 topic pub /turret_controller/commands std_msgs/msg/Float64MultiArray "{data: [1.0, 0.0]}"
 ```
 
-* The array represents joint commands (e.g., yaw, pitch).
-* Adjust values based on your turret configuration.
+- The array represents joint commands (e.g., yaw, pitch).
+- Adjust values based on your turret configuration.
 
 ---
 
@@ -166,9 +167,11 @@ waypoint_detector_node:
 ## Sending Navigation Goal
 
 ```bash
-ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
-"{pose: {header: {frame_id: 'map'}, pose: {position: {x: 25.0, y: 1.0, z: 0.0}, orientation: {z: 0.0, w: 1.0}}}}"
+ros2 topic pub --once /goal_decomposer/goal geometry_msgs/msg/PoseStamped \ 
+  "{header: {frame_id: 'map'}, pose: {position: {x: p, y: q}}}"
 ```
+
+- update coordinate assignment by replacing (p, q) with the target UGV destination coordinates.
 
 ---
 
