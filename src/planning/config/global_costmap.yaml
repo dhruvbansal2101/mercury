@@ -10,13 +10,6 @@ global_costmap:
 
       resolution: 0.05
 
-      # CRITICAL FIX: Must be large enough to contain the goal.
-      # Robot starts at (0,0) and goal is (26,-7).
-      # Distance = sqrt(26^2 + 7^2) = 26.9m
-      # Use 70x70m to comfortably cover the full track.
-      # At 0.05m resolution: 1400x1400 cells — heavier but necessary.
-      # If performance is too slow, use rolling_window: false and a
-      # static map instead.
       rolling_window: true
       width: 70
       height: 70
@@ -26,8 +19,25 @@ global_costmap:
       footprint: "[[0.25, 0.24], [0.25, -0.24], [-0.25, -0.24], [-0.25, 0.24]]"
       footprint_padding: 0.05
 
-      plugins: ["obstacle_layer", "inflation_layer"]
+      plugins: ["lane_layer", "obstacle_layer", "inflation_layer"]
 
+      # ── Lane boundary layer ──────────────────────────────────────────────
+      # Published by lane_costmap_node with TRANSIENT_LOCAL durability (latched).
+      # Nav2 StaticLayer subscribes once and re-reads on each update.
+      lane_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: /perception/road_costmap
+        subscribe_to_updates: true
+        enabled: true
+        # MUST be true for a latched/transient-local publisher.
+        # Without this the StaticLayer misses the first (and only) publish.
+        map_subscribe_transient_local: true
+        # -1 in our OccupancyGrid = unknown, let it pass through as-is.
+        unknown_cost_value: -1
+        # Cells with value >= 100 are lethal in the costmap.
+        lethal_cost_threshold: 100
+
+      # ── LiDAR obstacle layer ─────────────────────────────────────────────
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -43,13 +53,11 @@ global_costmap:
           raytrace_max_range: 10.0
           obstacle_min_range: 0.15
           obstacle_max_range: 8.0
-          # Keep obstacles in map for 2s to handle occlusion on curves
           observation_persistence: 2.0
           inf_is_valid: True
 
+      # ── Inflation layer ──────────────────────────────────────────────────
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # 0.35m inflation — enough to avoid obstacles without over-constraining
-        # the path near lane edges.
         inflation_radius: 0.35
         cost_scaling_factor: 2.5

@@ -32,6 +32,7 @@ setup(
             'calibrate_homography = perception.calibrate_homography:main',
             # NEW: lightweight detection node that feeds lane_assist_node
             'lane_detection = perception.lane_detection:main',
+            'lane_costmap = perception.lane_costmap_node:main',
         ],
     },
 )

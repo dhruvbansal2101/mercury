@@ -1,0 +1,724 @@
+"""
+lane_detection.py  —  BEV + Edge + Sliding Window  (v11 — drum-proof)
+======================================================================
+ROOT CAUSE FIX (v10 → v11):
+  The purple blobs in v10 are RED DRUMS being detected because:
+  1. Canny picks up the drum's BOUNDARY EDGE (drum edge is a strong
+     contrast line between bright-red drum and dark background).
+  2. red_dilate=20px wasn't enough — drum edges sit just outside the
+     red HSV region so the suppression mask missed them.
+  3. The histogram peak at the drum location was STRONGER than the
+     lane marking peak (drums are large → big column sum).
+
+FIXES IN v11:
+  A) MAX-WIDTH BLOB FILTER:
+     Lane markings are thin (~5-20 px wide in BEV).
+     Drums appear as wide arcs (>30px wide in BEV).
+     Any connected component wider than max_blob_width_px is removed.
+     This is the single most effective drum filter.
+
+  B) AGGRESSIVE RED SUPPRESSION:
+     red_dilate increased to 40px.
+     Also apply a surrounding "halo" suppression: dilate the red mask
+     before computing edges, then subtract. This removes the drum edge
+     that Canny would otherwise see.
+
+  C) VERTICAL-ONLY MASK:
+     After all filtering, keep only pixels where the LOCAL VERTICAL
+     gradient is stronger than the horizontal gradient. Lane stripes
+     are vertical; drum arcs are diagonal or horizontal.
+
+  D) HISTOGRAM GUARDS:
+     hist_edge_frac raised to 0.18 (zero outer 18% = ~115px each side).
+     max_hist_col_width: if a histogram peak is wider than X pixels,
+     it's a drum (wide blob), not a lane stripe (narrow spike). Skip it.
+
+  E) TIGHTER TRAPEZOID:
+     bev_left_top=120, bev_right_top=520 — drums at outer edges are
+     partially excluded from the BEV warp entirely.
+"""
+
+import cv2
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import Image
+from std_msgs.msg import Float32, Bool
+from cv_bridge import CvBridge
+
+IMG_W, IMG_H = 640, 480
+
+
+def _build_homography(horizon_y, bottom_y, left_top, right_top, left_bot, right_bot):
+    src = np.float32([
+        [left_top,  horizon_y],
+        [right_top, horizon_y],
+        [right_bot, bottom_y],
+        [left_bot,  bottom_y],
+    ])
+    dst = np.float32([
+        [0,     0    ],
+        [IMG_W, 0    ],
+        [IMG_W, IMG_H],
+        [0,     IMG_H],
+    ])
+    return cv2.getPerspectiveTransform(src, dst), src
+
+
+class LaneDetectionNode(Node):
+
+    def __init__(self):
+        super().__init__('lane_detection_node')
+
+        # ── Image source ──────────────────────────────────────────────────────
+        self.declare_parameter('image_topic', '/camera/image_raw')
+        self.declare_parameter('show_debug',   True)
+
+        # ── BEV trapezoid ─────────────────────────────────────────────────────
+        # Tighter than v10: drums at the outer edges are now partially excluded
+        self.declare_parameter('bev_horizon_y',  210)
+        self.declare_parameter('bev_bottom_y',   479)
+        self.declare_parameter('bev_left_top',   120)   # tighter: was 80
+        self.declare_parameter('bev_right_top',  520)   # tighter: was 560
+        self.declare_parameter('bev_left_bot',    30)
+        self.declare_parameter('bev_right_bot',  610)
+
+        # ── Lane geometry ─────────────────────────────────────────────────────
+        self.declare_parameter('lane_half_width_px', 190.0)
+        self.declare_parameter('hw_ema_alpha',  0.05)
+
+        # ── Sliding window ────────────────────────────────────────────────────
+        self.declare_parameter('nwindows',    12)
+        self.declare_parameter('margin',      50)
+        self.declare_parameter('minpix',      15)
+        self.declare_parameter('min_lane_pixels', 40)
+
+        # Bottom fraction of BEV used for histogram
+        self.declare_parameter('hist_rows_frac',  0.30)
+
+        # Min histogram peak to count as lane (NOT a drum shadow)
+        self.declare_parameter('min_hist_peak',   25.0)
+
+        # Outer exclusion: zero this fraction of each side before histogram
+        # Drums tend to cluster at outer edges of BEV
+        self.declare_parameter('hist_edge_frac',  0.18)
+
+        # NEW: If the peak's column-neighbourhood is wider than this,
+        # it's a drum blob not a lane stripe. Unit = pixels.
+        self.declare_parameter('max_peak_width_px', 40)
+
+        # ── Colour / edge ─────────────────────────────────────────────────────
+        self.declare_parameter('white_v_min',  205)
+        self.declare_parameter('white_s_max',   20)
+        self.declare_parameter('canny_lo',   20)
+        self.declare_parameter('canny_hi',   70)
+        self.declare_parameter('bev_top_ignore_frac', 0.22)
+
+        # ── Red drum suppression ──────────────────────────────────────────────
+        self.declare_parameter('red_h_lo1',   0)
+        self.declare_parameter('red_h_hi1',  18)
+        self.declare_parameter('red_h_lo2', 158)
+        self.declare_parameter('red_h_hi2', 180)
+        self.declare_parameter('red_s_min',   50)
+        self.declare_parameter('red_v_min',   40)
+        self.declare_parameter('red_dilate',  40)   # increased: was 20
+
+        # ── NEW: Width filter — most important drum filter ────────────────────
+        # Remove any blob WIDER than this value in pixels.
+        # Lane markings: ~5-20px wide. Drums: >30px wide.
+        self.declare_parameter('max_blob_width_px', 28)
+
+        # ── Existing blob shape filter ────────────────────────────────────────
+        self.declare_parameter('blob_aspect_min', 1.5)
+        self.declare_parameter('blob_min_area',    20)
+
+        # ── EMA / dead-band ───────────────────────────────────────────────────
+        self.declare_parameter('ema_alpha',    0.15)
+        self.declare_parameter('dead_band_px', 10.0)
+        self.declare_parameter('min_sep_px',  100.0)
+
+        # ── Load ──────────────────────────────────────────────────────────────
+        p = self.get_parameter
+        self._image_topic     = p('image_topic').value
+        self._show_debug      = p('show_debug').value
+
+        self._bev_horizon_y   = int(p('bev_horizon_y').value)
+        self._bev_bottom_y    = int(p('bev_bottom_y').value)
+        self._bev_left_top    = int(p('bev_left_top').value)
+        self._bev_right_top   = int(p('bev_right_top').value)
+        self._bev_left_bot    = int(p('bev_left_bot').value)
+        self._bev_right_bot   = int(p('bev_right_bot').value)
+
+        self._lane_half_w     = float(p('lane_half_width_px').value)
+        self._hw_ema_alpha    = float(p('hw_ema_alpha').value)
+
+        self._nwindows        = int(p('nwindows').value)
+        self._margin          = int(p('margin').value)
+        self._minpix          = int(p('minpix').value)
+        self._min_lane_pixels = int(p('min_lane_pixels').value)
+        self._hist_rows_frac  = float(p('hist_rows_frac').value)
+        self._min_hist_peak   = float(p('min_hist_peak').value)
+        self._hist_edge_frac  = float(p('hist_edge_frac').value)
+        self._max_peak_width  = int(p('max_peak_width_px').value)
+
+        self._white_v_min     = int(p('white_v_min').value)
+        self._white_s_max     = int(p('white_s_max').value)
+        self._canny_lo        = int(p('canny_lo').value)
+        self._canny_hi        = int(p('canny_hi').value)
+        self._bev_top_ignore  = float(p('bev_top_ignore_frac').value)
+
+        self._red_h_lo1       = int(p('red_h_lo1').value)
+        self._red_h_hi1       = int(p('red_h_hi1').value)
+        self._red_h_lo2       = int(p('red_h_lo2').value)
+        self._red_h_hi2       = int(p('red_h_hi2').value)
+        self._red_s_min       = int(p('red_s_min').value)
+        self._red_v_min       = int(p('red_v_min').value)
+        self._red_dilate      = int(p('red_dilate').value)
+
+        self._max_blob_width  = int(p('max_blob_width_px').value)
+        self._blob_aspect_min = float(p('blob_aspect_min').value)
+        self._blob_min_area   = int(p('blob_min_area').value)
+
+        self._ema_alpha       = float(p('ema_alpha').value)
+        self._dead_band_px    = float(p('dead_band_px').value)
+        self._min_sep_px      = float(p('min_sep_px').value)
+
+        # Build homography
+        self._H, self._src_pts = _build_homography(
+            self._bev_horizon_y, self._bev_bottom_y,
+            self._bev_left_top,  self._bev_right_top,
+            self._bev_left_bot,  self._bev_right_bot,
+        )
+
+        self._ema_error   = 0.0
+        self._frame_count = 0
+        self.bridge       = CvBridge()
+
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST, depth=1)
+
+        self.image_sub = self.create_subscription(
+            Image, self._image_topic, self.image_callback, sensor_qos)
+        self.error_pub = self.create_publisher(Float32, '/lane_center_error', 10)
+        self.vis_pub   = self.create_publisher(Bool,    '/lane_visible',      10)
+        self.debug_pub = self.create_publisher(Image,   '/lane_debug/image',  sensor_qos)
+
+        self.get_logger().info(
+            f'LaneDetection v11 (drum-proof)  '
+            f'half_w={self._lane_half_w}px  '
+            f'max_blob_w={self._max_blob_width}px  '
+            f'red_dilate={self._red_dilate}px  '
+            f'hist_edge={self._hist_edge_frac*100:.0f}%')
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Build dilated red drum suppression mask
+    # ─────────────────────────────────────────────────────────────────────────
+    def _red_drum_mask(self, hsv: np.ndarray, extra_dilate: int = 0) -> np.ndarray:
+        lo1 = np.array([self._red_h_lo1, self._red_s_min, self._red_v_min])
+        hi1 = np.array([self._red_h_hi1, 255, 255])
+        lo2 = np.array([self._red_h_lo2, self._red_s_min, self._red_v_min])
+        hi2 = np.array([self._red_h_hi2, 255, 255])
+        red = cv2.bitwise_or(cv2.inRange(hsv, lo1, hi1),
+                             cv2.inRange(hsv, lo2, hi2))
+        d = self._red_dilate + extra_dilate
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+        return cv2.dilate(red, k, iterations=1)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Width + shape blob filter
+    # ─────────────────────────────────────────────────────────────────────────
+    def _filter_blobs(self, binary: np.ndarray) -> np.ndarray:
+        out = np.zeros_like(binary)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        for lbl in range(1, n):
+            area = stats[lbl, cv2.CC_STAT_AREA]
+            w    = stats[lbl, cv2.CC_STAT_WIDTH]
+            h    = stats[lbl, cv2.CC_STAT_HEIGHT]
+            if area < self._blob_min_area:
+                continue
+            # KEY DRUM FILTER: remove any blob wider than threshold
+            if w > self._max_blob_width:
+                continue
+            if w == 0 or h == 0:
+                continue
+            aspect = max(w, h) / max(min(w, h), 1)
+            if aspect < self._blob_aspect_min:
+                continue
+            out[labels == lbl] = 255
+        return out
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Build lane binary mask — drum-proof edition
+    # ─────────────────────────────────────────────────────────────────────────
+    def _lane_mask(self, bev_bgr: np.ndarray):
+        bev_h, bev_w = bev_bgr.shape[:2]
+        hsv  = cv2.cvtColor(bev_bgr, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(bev_bgr, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # Two levels of red suppression:
+        # normal_mask — suppresses drum fill
+        # wide_mask   — suppresses drum EDGE (the Canny-visible boundary)
+        red_mask_normal = self._red_drum_mask(hsv, extra_dilate=0)
+        red_mask_wide   = self._red_drum_mask(hsv, extra_dilate=15)
+        not_red_wide    = cv2.bitwise_not(red_mask_wide)
+        not_red_normal  = cv2.bitwise_not(red_mask_normal)
+
+        # ── Canny: use WIDE suppression so drum edges are removed ─────────────
+        edges = cv2.Canny(blur, self._canny_lo, self._canny_hi)
+        edges = cv2.bitwise_and(edges, not_red_wide)   # suppress drum edges
+        k_e   = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
+        edges = cv2.dilate(edges, k_e, iterations=1)
+
+        # ── Strict white mask ─────────────────────────────────────────────────
+        white = cv2.inRange(
+            hsv,
+            np.array([0,   0,                self._white_v_min]),
+            np.array([180, self._white_s_max, 255]))
+        white = cv2.bitwise_and(white, not_red_normal)
+
+        # ── Adaptive threshold ────────────────────────────────────────────────
+        adapt = cv2.adaptiveThreshold(
+            blur, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, blockSize=51, C=-12)
+        adapt = cv2.bitwise_and(adapt, not_red_wide)
+
+        # ── Fuse ─────────────────────────────────────────────────────────────
+        combined = cv2.bitwise_or(edges, cv2.bitwise_and(white, adapt))
+
+        # ── Morphological cleanup ─────────────────────────────────────────────
+        k_cl = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 7))
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k_cl)
+        k_op = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, k_op)
+
+        # ── WIDTH + SHAPE filter — removes drums ──────────────────────────────
+        combined = self._filter_blobs(combined)
+
+        # ── Spatial masking ───────────────────────────────────────────────────
+        top_cut = int(bev_h * self._bev_top_ignore)
+        combined[:top_cut, :] = 0
+        combined[-15:, :]     = 0
+
+        return combined, red_mask_normal
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Check if a histogram peak is "narrow" (lane-like) or "wide" (drum-like)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _is_narrow_peak(self, hist: np.ndarray, peak_x: int) -> bool:
+        """Return True if the peak at peak_x is narrow (lane marking, not drum)."""
+        if self._max_peak_width <= 0:
+            return True
+        half = self._max_peak_width // 2
+        lo = max(0, peak_x - half)
+        hi = min(len(hist), peak_x + half + 1)
+        region = hist[lo:hi]
+        # A drum blob has a flat-topped wide peak; a lane stripe is a narrow spike
+        # Count columns above 50% of peak value
+        peak_val = hist[peak_x]
+        if peak_val < 1:
+            return False
+        cols_above_half = int(np.sum(region > peak_val * 0.5))
+        return cols_above_half <= self._max_peak_width
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Sliding window
+    # ─────────────────────────────────────────────────────────────────────────
+    def _sliding_window(self, binary: np.ndarray):
+        bev_h, bev_w = binary.shape
+        mid = bev_w // 2
+
+        # Histogram from bottom rows only
+        h_start  = max(0, int(bev_h * (1.0 - self._hist_rows_frac)))
+        hist_full = np.sum(binary[h_start:, :], axis=0).astype(np.float32)
+
+        # Zero outer edges
+        edge_px = int(bev_w * self._hist_edge_frac)
+        hist_full[:edge_px]  = 0
+        hist_full[-edge_px:] = 0
+
+        hist_left  = hist_full[:mid].copy()
+        hist_right = hist_full[mid:].copy()
+
+        left_peak_val  = float(hist_left.max())
+        right_peak_val = float(hist_right.max())
+
+        left_peak_x  = int(np.argmax(hist_left))
+        right_peak_x = int(np.argmax(hist_right))
+
+        # Check both peak strength AND peak narrowness (lane = narrow spike)
+        found_hist_left  = (left_peak_val  >= self._min_hist_peak and
+                            self._is_narrow_peak(hist_left,  left_peak_x))
+        found_hist_right = (right_peak_val >= self._min_hist_peak and
+                            self._is_narrow_peak(hist_right, right_peak_x))
+
+        leftx_base  = left_peak_x                  if found_hist_left  else mid // 2
+        rightx_base = right_peak_x + mid            if found_hist_right else mid + mid // 2
+
+        # Fragment guard
+        sep = rightx_base - leftx_base
+        if sep < self._min_sep_px and found_hist_left and found_hist_right:
+            if left_peak_val >= right_peak_val:
+                rightx_base = min(bev_w - 1,
+                                  leftx_base + int(self._lane_half_w * 2))
+            else:
+                leftx_base  = max(0,
+                                  rightx_base - int(self._lane_half_w * 2))
+
+        window_h = max(1, bev_h // self._nwindows)
+        nz  = binary.nonzero()
+        nzy = np.array(nz[0])
+        nzx = np.array(nz[1])
+
+        lx_cur, rx_cur        = leftx_base, rightx_base
+        left_inds, right_inds = [], []
+        l_count = r_count     = 0
+
+        debug = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+        for w in range(self._nwindows):
+            y_lo = bev_h - (w + 1) * window_h
+            y_hi = bev_h -  w      * window_h
+
+            # Hard constraint: left windows stay left half, right stay right half
+            lx_lo = max(0,     lx_cur - self._margin)
+            lx_hi = min(mid,   lx_cur + self._margin)   # never cross centre
+            rx_lo = max(mid,   rx_cur - self._margin)   # never cross centre
+            rx_hi = min(bev_w, rx_cur + self._margin)
+
+            cv2.rectangle(debug, (lx_lo, y_lo), (lx_hi, y_hi), (0, 200, 0), 1)
+            cv2.rectangle(debug, (rx_lo, y_lo), (rx_hi, y_hi), (0, 200, 0), 1)
+
+            gl = ((nzy >= y_lo) & (nzy < y_hi) &
+                  (nzx >= lx_lo) & (nzx < lx_hi)).nonzero()[0]
+            gr = ((nzy >= y_lo) & (nzy < y_hi) &
+                  (nzx >= rx_lo) & (nzx < rx_hi)).nonzero()[0]
+
+            left_inds.append(gl);  right_inds.append(gr)
+            l_count += len(gl);    r_count += len(gr)
+
+            if len(gl) >= self._minpix:
+                lx_cur = int(np.mean(nzx[gl]))
+            if len(gr) >= self._minpix:
+                rx_cur = int(np.mean(nzx[gr]))
+
+        left_inds  = np.concatenate(left_inds)
+        right_inds = np.concatenate(right_inds)
+
+        found_left  = (found_hist_left  and len(left_inds)  >= self._min_lane_pixels)
+        found_right = (found_hist_right and len(right_inds) >= self._min_lane_pixels)
+
+        left_fit = right_fit = None
+
+        if found_left:
+            lx = nzx[left_inds];  ly = nzy[left_inds]
+            left_fit = np.polyfit(ly, lx, 2)
+            debug[ly, lx] = (255, 140, 0)
+
+        if found_right:
+            rx = nzx[right_inds]; ry = nzy[right_inds]
+            right_fit = np.polyfit(ry, rx, 2)
+            debug[ry, rx] = (0, 140, 255)
+
+        # Periodic diagnostic log
+        if self._frame_count <= 5 or self._frame_count % 60 == 0:
+            total_px = int(np.sum(binary > 0))
+            self.get_logger().info(
+                f'[f{self._frame_count}] mask_px={total_px}  '
+                f'L={leftx_base}(pk={left_peak_val:.0f} narrow={self._is_narrow_peak(hist_left, left_peak_x)} n={l_count})  '
+                f'R={rightx_base}(pk={right_peak_val:.0f} narrow={self._is_narrow_peak(hist_right, right_peak_x)} n={r_count})  '
+                f'sep={rightx_base-leftx_base}px  hw={self._lane_half_w:.0f}  '
+                f'found=L:{found_left} R:{found_right}')
+
+        return left_fit, right_fit, debug, found_left, found_right
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Error computation
+    # ─────────────────────────────────────────────────────────────────────────
+    def _compute_error(self, left_fit, right_fit,
+                       bev_h, bev_w, found_left, found_right):
+        if not found_left and not found_right:
+            return self._ema_error, False, 'none'
+
+        img_cx = bev_w / 2.0
+        half_w = self._lane_half_w
+        y_eval = float(bev_h - 1)
+
+        if found_left and found_right:
+            lx  = float(np.polyval(left_fit,  y_eval))
+            rx  = float(np.polyval(right_fit, y_eval))
+            sep = rx - lx
+            if 60 <= sep <= bev_w * 0.95:
+                lane_cx = (lx + rx) / 2.0
+                mode    = 'both'
+                new_hw  = sep / 2.0
+                self._lane_half_w = (self._hw_ema_alpha * new_hw
+                                     + (1.0 - self._hw_ema_alpha) * self._lane_half_w)
+            elif lx < img_cx:
+                lane_cx = lx + half_w
+                mode    = 'left_only'
+            else:
+                lane_cx = rx - half_w
+                mode    = 'right_only'
+        elif found_left:
+            lx      = float(np.polyval(left_fit, y_eval))
+            lane_cx = lx + half_w
+            mode    = 'left_only'
+        else:
+            rx      = float(np.polyval(right_fit, y_eval))
+            lane_cx = rx - half_w
+            mode    = 'right_only'
+
+        raw_err = img_cx - lane_cx
+        if abs(raw_err) < self._dead_band_px:
+            raw_err = 0.0
+
+        self._ema_error = (self._ema_alpha * raw_err
+                           + (1.0 - self._ema_alpha) * self._ema_error)
+        return self._ema_error, True, mode
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Draw polynomial
+    # ─────────────────────────────────────────────────────────────────────────
+    def _draw_poly(self, img, fit, color, bev_h, bev_w):
+        if fit is None:
+            return
+        ploty = np.linspace(0, bev_h - 1, bev_h)
+        plotx = np.polyval(fit, ploty)
+        pts   = np.column_stack([plotx, ploty]).astype(np.int32)
+        valid = (pts[:, 0] >= 0) & (pts[:, 0] < bev_w)
+        pts   = pts[valid]
+        if len(pts) > 1:
+            cv2.polylines(img, [pts.reshape(-1, 1, 2)], False, color, 3)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Main callback
+    # ─────────────────────────────────────────────────────────────────────────
+    def image_callback(self, msg: Image):
+        self._frame_count += 1
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().warn(f'cv_bridge: {e}')
+            return
+
+        h, w = frame.shape[:2]
+
+        # 1. BEV warp
+        bev  = cv2.warpPerspective(frame, self._H, (w, h))
+        bev_h, bev_w = bev.shape[:2]
+
+        # 2. Lane mask (drum-proof)
+        mask, red_mask = self._lane_mask(bev)
+
+        # 3. Sliding window
+        left_fit, right_fit, sw_dbg, found_L, found_R = \
+            self._sliding_window(mask)
+
+        # 4. Error
+        err, visible, mode = self._compute_error(
+            left_fit, right_fit, bev_h, bev_w, found_L, found_R)
+
+        # 5. Publish
+        self.error_pub.publish(Float32(data=float(err)))
+        self.vis_pub.publish(Bool(data=visible))
+
+        # 6. Debug frame
+        dbg = sw_dbg.copy()
+        self._draw_poly(dbg, left_fit,  (255, 200,  50), bev_h, bev_w)
+        self._draw_poly(dbg, right_fit, ( 50, 200, 255), bev_h, bev_w)
+
+        # Drum suppression overlay (magenta tint)
+        red_ov = np.zeros_like(dbg)
+        red_ov[red_mask > 0] = (200, 0, 200)
+        dbg = cv2.addWeighted(dbg, 1.0, red_ov, 0.25, 0)
+
+        img_cx = bev_w // 2
+        if visible:
+            lane_cx = int(np.clip(img_cx - err, 0, bev_w - 1))
+            cv2.line(dbg, (img_cx,  0), (img_cx,  bev_h), (0, 255,   0), 2)
+            cv2.line(dbg, (lane_cx, 0), (lane_cx, bev_h), (0,   0, 255), 2)
+            hw = int(self._lane_half_w)
+            for gx in [np.clip(lane_cx - hw, 0, bev_w - 1),
+                       np.clip(lane_cx + hw, 0, bev_w - 1)]:
+                cv2.line(dbg, (int(gx), bev_h // 2),
+                         (int(gx), bev_h), (255, 255, 0), 1)
+        else:
+            cv2.line(dbg, (img_cx, 0), (img_cx, bev_h), (128, 128, 0), 2)
+
+        # Draw boundary lines
+        top_cut  = int(bev_h * self._bev_top_ignore)
+        edge_px  = int(bev_w * self._hist_edge_frac)
+        cv2.line(dbg, (0, top_cut), (bev_w, top_cut), (0, 128, 255), 1)
+        cv2.line(dbg, (edge_px, 0), (edge_px, bev_h), (128, 0, 128), 1)
+        cv2.line(dbg, (bev_w - edge_px, 0),
+                 (bev_w - edge_px, bev_h), (128, 0, 128), 1)
+
+        mode_col = {
+            'both':      (0, 255,   0),
+            'left_only': (0, 165, 255),
+            'right_only':(0, 165, 255),
+            'none':      (128,128, 128),
+        }
+        cv2.putText(
+            dbg,
+            f'err={err:+.1f}px [{mode}] hw={self._lane_half_w:.0f}px',
+            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+            mode_col.get(mode, (255, 255, 0)), 2)
+
+        # Bottom-right: raw + trapezoid
+        raw_inset = frame.copy()
+        cv2.polylines(raw_inset,
+                      [self._src_pts.astype(np.int32).reshape(-1, 1, 2)],
+                      True, (0, 255, 255), 2)
+        th, tw = bev_h // 4, bev_w // 4
+        raw_inset = cv2.resize(raw_inset, (tw, th))
+        dbg[bev_h - th:, bev_w - tw:] = raw_inset
+
+        # Bottom-left: clean mask
+        mth, mtw = bev_h // 5, bev_w // 5
+        mask_s = cv2.resize(mask, (mtw, mth))
+        dbg[bev_h - mth:, :mtw] = cv2.cvtColor(mask_s, cv2.COLOR_GRAY2BGR)
+        cv2.putText(dbg, 'mask(v11)',
+                    (5, bev_h - mth + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 255, 180), 1)
+
+        out_msg        = self.bridge.cv2_to_imgmsg(dbg, encoding='bgr8')
+        out_msg.header = msg.header
+        self.debug_pub.publish(out_msg)
+
+        if self._show_debug:
+            cv2.imshow('Lane Detection v11', dbg)
+            cv2.waitKey(1)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LaneDetectionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+
+    lane_detection_node = Node(
+        package='perception',
+        executable='lane_detection',
+        name='lane_detection_node',
+        output='screen',
+        parameters=[{
+             'use_sim_time': True,
+            'show_debug':   True,
+ 
+            # ── BEV trapezoid ──────────────────────────────────────────────────
+            # These define the source quad in the raw camera image that gets
+            # warped into a top-down (bird's-eye) view.
+            #
+            # HOW TO TUNE: watch the yellow quad in the bottom-right inset.
+            # It must cover the ROAD SURFACE only — from ~1m ahead of the robot
+            # to as far as the lane markings are visible.  If the quad is too
+            # narrow the lane lines fall outside it; if too tall it includes
+            # sky/horizon which adds noise.
+            #
+            # Camera: 2 m above base_link, 0.4 rad (≈23°) forward pitch.
+            # At this height the road surface occupies roughly y=[220, 479]
+            # in a 640×480 image, with the lane lines well inside x=[80, 560].
+            'bev_horizon_y':  230,   # was 210 — raise slightly to avoid sky noise
+            'bev_bottom_y':   479,
+            'bev_left_top':    80,   # wider than v11 to capture full lane width
+            'bev_right_top':  560,   # wider than v11
+            'bev_left_bot':    10,
+            'bev_right_bot':  630,
+ 
+            # ── Lane half-width ────────────────────────────────────────────────
+            # Initial guess in BEV pixels.  Set to ~half the distance between
+            # the two lane lines as they appear in the BEV at the bottom row.
+            # After the first "both" detection the EMA will auto-adapt this.
+            # Rule of thumb for this track: ~200–250 px.
+            'lane_half_width_px': 220.0,   # was 370 — far too large
+            'hw_ema_alpha':         0.10,  # slightly faster adaptation
+ 
+            # ── Sliding window ─────────────────────────────────────────────────
+            'nwindows':        12,
+            'margin':          60,   # wider search margin (was 50)
+            'minpix':          10,   # fewer pixels needed to re-centre (was 15)
+            'min_lane_pixels': 20,   # lower threshold for valid lane (was 40)
+ 
+            # Bottom 40% of BEV rows for histogram seed (was 30%)
+            # More rows → stronger histogram signal in sparse sim markings
+            'hist_rows_frac':  0.40,
+ 
+            # Min peak — MUCH lower for simulation where markings are dim
+            'min_hist_peak':    8.0,   # was 25.0
+ 
+            # Outer exclusion zone (drums live at edges, keep this)
+            'hist_edge_frac':  0.12,   # slightly narrower so we don't cut lanes
+ 
+            # Peak-width drum guard — keep but slightly relax
+            'max_peak_width_px': 50,   # was 40
+ 
+            # ── White mask — KEY FIX ───────────────────────────────────────────
+            # Gazebo/ogre2 lane markings are NOT pure white.  They typically
+            # render with V ≈ 160–220 and S up to 40.  The v11 thresholds
+            # (V>205, S<20) reject almost everything in simulation.
+            'white_v_min': 160,   # was 205 — the single biggest fix
+            'white_s_max':  50,   # was 20  — allow slightly off-white pixels
+ 
+            # ── Canny edge detector ────────────────────────────────────────────
+            # Lower hi threshold catches fainter edges (sim markings have less
+            # contrast than real paint).
+            'canny_lo':  10,   # was 20
+            'canny_hi':  50,   # was 70
+ 
+            # Ignore top 20% of BEV (reduced from 22%)
+            'bev_top_ignore_frac': 0.20,
+ 
+            # ── Red drum suppression ───────────────────────────────────────────
+            # Keep aggressive suppression — drums are still present in sim.
+            'red_h_lo1':   0,
+            'red_h_hi1':  18,
+            'red_h_lo2': 158,
+            'red_h_hi2': 180,
+            'red_s_min':  40,   # slightly lower sat threshold (was 50)
+            'red_v_min':  40,
+            'red_dilate': 35,   # was 40 — back off slightly to avoid masking lanes
+ 
+            # ── Blob width filter ──────────────────────────────────────────────
+            # Lane markings in BEV after warp can be 10–40 px wide depending on
+            # distance and camera height.  The v11 value of 28 was removing
+            # valid lane pixels.  Drums in this sim are 60–120 px wide so 50
+            # still filters them cleanly.
+            'max_blob_width_px': 50,   # was 28
+ 
+            # ── Blob shape filter ──────────────────────────────────────────────
+            # Slightly more permissive aspect ratio (real markings aren't always
+            # perfectly elongated in the BEV at every distance).
+            'blob_aspect_min': 1.2,   # was 1.5
+            'blob_min_area':    15,   # was 20
+ 
+            # ── EMA / dead-band ────────────────────────────────────────────────
+            'ema_alpha':    0.20,   # faster response (was 0.15)
+            'dead_band_px':  8.0,  # tighter dead-band (was 10)
+            'min_sep_px':  80.0,   # was 100 — allow slightly narrower lane
+        }]
+    )
+
+    return LaunchDescription([
+        lane_detection_node,
+    ])

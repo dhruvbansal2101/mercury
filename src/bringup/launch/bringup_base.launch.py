@@ -56,6 +56,52 @@ def generate_launch_description():
         )
     )
 
+    # ── Lane costmap node ──────────────────────────────────────────────────
+    # Projects camera lane boundaries into a persistent OccupancyGrid
+    # (/perception/road_costmap, map frame) so Nav2's global planner
+    # treats outside-lane areas as lethal obstacles.
+    # Parameters below must match the camera URDF sensor config and the
+    # global_costmap.yaml map extent / origin.
+    lane_costmap = Node(
+        package='perception',
+        executable='lane_costmap',
+        name='lane_costmap',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+
+            # ── Map extent — must match global_costmap.yaml ──────────────
+            'map_width_m':    70.0,
+            'map_height_m':   70.0,
+            'resolution':      0.10,   # 0.10 m/cell → 700×700 grid
+            'map_origin_x':  -35.0,
+            'map_origin_y':  -35.0,
+
+            # ── Camera sensor (matches URDF robot_sensors.xacro) ─────────
+            'camera_hfov':   1.047,    # rad  (from sensor config)
+            'image_width':   640,
+            'image_height':  480,
+
+            # ── Detection tuning ─────────────────────────────────────────
+            'roi_top_frac':  0.35,     # ignore top 35% (sky, far distance)
+            'sample_rows':   8,        # rows to project per frame
+            'white_v_min':   170,      # HSV value threshold for white lanes
+            'white_s_max':   60,       # HSV saturation threshold
+
+            # ── Projection extent ─────────────────────────────────────────
+            # Pixels projected outside each boundary → marked lethal (100).
+            # 48 px × ~0.005 m/px (close range) ≈ 0.25 m outside the line.
+            'obstacle_pixels_outside': 48,
+            # Pixels projected inside boundary → confirmed free (0).
+            'free_pixels_inside':      32,
+
+            # ── Performance ───────────────────────────────────────────────
+            'publish_rate':    5.0,    # Hz  (StaticLayer re-reads each update)
+            'process_every_n': 3,      # process 1-in-3 camera frames (~10 Hz)
+        }]
+    )
+
+    # ── Goal decomposer ────────────────────────────────────────────────────
     goal_decomposer = Node(
         package='bringup',
         executable='goal_decomposer',
@@ -63,31 +109,15 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'use_sim_time': True,
-
-            # ── Gate / waypoint spacing ───────────────────────────────
-            # Sample a gate plane every 2.0m along the planned path.
-            # Gates are placed ON the lane centre (planner follows costmap).
-            # Increase for faster but coarser waypoint tracking.
             'path_sample_dist': 2.0,
-
-            # Gate plane is 1.0m before the waypoint centre.
-            # Robot "crosses" the gate when it passes this imaginary
-            # finish line — it does NOT need to reach the exact point.
-            # Increase if gates are not triggering (robot passing too fast).
-            # Decrease if gates trigger too early.
             'gate_dist': 1.0,
-
-            # Ignore new goals within 0.5m of current goal (debounce)
             'min_goal_dist': 0.5,
-
-            # Wait this long before retrying the planner
             'plan_retry_delay_sec': 4.0,
-
-            # Wait this long after canceling Nav2 before re-sending
             'nav2_settle_sec': 1.5,
         }]
     )
 
+    # ── Lane assist node ───────────────────────────────────────────────────
     lane_assist = Node(
         package='bringup',
         executable='lane_assist_node',
@@ -123,6 +153,7 @@ def generate_launch_description():
         localization,
         planning,
         perception,
+        lane_costmap,       # ← new: builds lane boundary costmap for Nav2
         goal_decomposer,
         lane_assist,
         rviz_node,
