@@ -80,6 +80,13 @@ def generate_launch_description():
         }]
     )
 
+    recovery_node = Node(
+        package='recovery_manager',
+        executable='recovery_node',
+        name='recovery_node',
+        output='screen'
+    )
+
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
@@ -99,6 +106,7 @@ def generate_launch_description():
         localization,
         planning,
         perception,
-        lane_bev_carrot_node,   
+        lane_bev_carrot_node, 
+        recovery_node,  
         rviz_node,
     ])

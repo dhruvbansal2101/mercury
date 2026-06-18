@@ -1,22 +1,25 @@
 """
-lane_bev_carrot_node.py  v5
+lane_bev_carrot_node.py  v6
 ---------------------------
+CHANGELOG vs v5
+---------------
+* Added /recovery_active handoff. The recovery_node owns the robot during
+  recovery and publishes /recovery_active (Bool). While it is True this node
+  stays completely silent (publishes nothing to /goal_pose), so the two nodes
+  never race on the topic. A stale-timeout failsafe means that if the recovery
+  node goes silent (crash), this node resumes after recovery_active_timeout_sec.
+
 CHANGELOG vs v4
 ---------------
-* Removed _publish_stop() — it published robot odom coords with frame_id='map',
-  causing nav goals to land at wrong map positions (the "random ass" destinations
-  visible in logs as 17.x goals when robot is at 23.x).
-
-* Added _fallback_carrot(fwd) — when BEV lane fit finds no safe carrot, sweeps
+* Removed _publish_stop(): it published robot odom coords with frame_id='map',
+  causing nav goals to land at wrong map positions.
+* Added _fallback_carrot(fwd): when BEV lane fit finds no safe carrot, sweeps
   a grid of points directly ahead at varying distances and lateral offsets,
   returning the first that passes _is_safe().
-
-* Added _straight_ahead_carrot(dist) — unconditional last resort: place the
-  carrot dist metres ahead along the robot's current heading.  No safety check.
-  This guarantees the robot always has somewhere to go and never stops dead.
+* Added _straight_ahead_carrot(dist): unconditional last resort.
 
 * _tick() fallback chain:
-    BEV lane fit carrot  →  lateral sweep fallback  →  straight-ahead crawl
+    BEV lane fit carrot  ->  lateral sweep fallback  ->  straight-ahead crawl
 
 Safety: TWO independent obstacle checks per candidate (unchanged from v4):
   1. road_costmap  (/perception/road_costmap, map frame, 5 Hz)
@@ -33,6 +36,7 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, LaserScan
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, OccupancyGrid
+from std_msgs.msg import Bool
 from ament_index_python.packages import get_package_share_directory
 import tf_transformations
 
@@ -67,14 +71,18 @@ class LaneBevCarrotNode(Node):
         self.declare_parameter('min_clear_m',             0.6)
         self.declare_parameter('safety_radius',           0.30)
         self.declare_parameter('max_carrot_dist_m',       4.0)
-        
 
-        # ── NEW: fallback parameters ───────────────────────────────────────────
+        # -- fallback parameters --
         # Lateral sweep: distances and offsets tried when BEV carrot fails
         self.declare_parameter('fallback_dists_m',    [1.0, 0.75, 1.5])
         self.declare_parameter('fallback_laterals_m', [0.0, -0.3, 0.3, -0.6, 0.6])
         # Straight-ahead crawl distance when even lateral sweep fails
         self.declare_parameter('straight_ahead_dist_m', 0.75)
+
+        # -- recovery handoff --
+        # If recovery_node goes silent for longer than this while we believe it
+        # is active, assume it crashed and resume control (fail-safe).
+        self.declare_parameter('recovery_active_timeout_sec', 2.0)
 
         p = lambda n: self.get_parameter(n).value
         self._carrot_dist     = float(p('carrot_dist_m'))
@@ -96,6 +104,8 @@ class LaneBevCarrotNode(Node):
         self._fallback_dists    = list(p('fallback_dists_m'))
         self._fallback_laterals = list(p('fallback_laterals_m'))
         self._straight_dist     = float(p('straight_ahead_dist_m'))
+
+        self._recovery_timeout  = float(p('recovery_active_timeout_sec'))
 
         self._fx = (img_w/2.0)/math.tan(hfov/2.0)
         self._cx = img_w/2.0
@@ -133,9 +143,12 @@ class LaneBevCarrotNode(Node):
         self._last_fit        = None
         self._last_fit_stamp  = None
         self._streak          = 0
-        # Finish-line gate: unit vector (robot→goal at goal-set time), map frame.
-        # Computed lazily on first tick after a new goal arrives.
+        # Finish-line gate: unit vector (robot->goal at goal-set time), map frame.
         self._approach_dir: tuple | None = None   # (dx, dy) unit vec
+
+        # recovery handoff state
+        self._recovery_active       = False
+        self._recovery_active_stamp = None   # last time we heard from recovery node
 
         # road costmap
         self._road_grid = None
@@ -161,17 +174,21 @@ class LaneBevCarrotNode(Node):
         self.create_subscription(Image,        '/camera/image_raw',             self._img_cb,     sq)
         self.create_subscription(OccupancyGrid,'/perception/road_costmap',      self._road_cb,    lq)
         self.create_subscription(LaserScan,    '/scan',                         self._scan_cb,    sq)
-        self.create_subscription(OccupancyGrid, '/perception/pothole_costmap', self._pothole_cb, lq)
+        self.create_subscription(OccupancyGrid, '/perception/pothole_costmap',  self._pothole_cb, lq)
+        # Recovery ownership flag. Keep default (volatile) QoS to match the
+        # recovery node's publisher; transient_local here would be incompatible.
+        self.create_subscription(Bool,         '/recovery_active',              self._recovery_active_cb, 10)
 
         self._pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
         self.create_timer(1.0/rate, self._tick)
         self.get_logger().info(
-            f'LaneBevCarrotNode v5 | safe_cost={self._safe_cost_max} '
+            f'LaneBevCarrotNode v6 | safe_cost={self._safe_cost_max} '
             f'min_clear={self._min_clear_m}m | '
             f'fallback_dists={self._fallback_dists} '
-            f'straight_ahead={self._straight_dist}m')
+            f'straight_ahead={self._straight_dist}m | '
+            f'recovery_timeout={self._recovery_timeout}s')
 
-    # ── callbacks ──────────────────────────────────────────────────────
+    # -- callbacks --
 
     def _goal_cb(self, msg):
         self._final_goal    = msg
@@ -194,10 +211,14 @@ class LaneBevCarrotNode(Node):
     def _road_cb(self, msg: OccupancyGrid):
         self._road_info = msg.info
         self._road_grid = msg.data
-    
+
     def _pothole_cb(self, msg: OccupancyGrid):
         self._pothole_info = msg.info
         self._pothole_grid = msg.data
+
+    def _recovery_active_cb(self, msg: Bool):
+        self._recovery_active       = bool(msg.data)
+        self._recovery_active_stamp = self.get_clock().now()
 
     def _scan_cb(self, msg: LaserScan):
         """Convert scan to map-frame point cloud and cache it."""
@@ -223,7 +244,7 @@ class LaneBevCarrotNode(Node):
 
         self._scan_pts_map = np.array(pts, dtype=np.float64) if pts else None
 
-    # ── safety checks ──────────────────────────────────────────────────
+    # -- safety checks --
 
     def _road_cost(self, wx, wy) -> int:
         if self._road_grid is None: return -1
@@ -232,7 +253,7 @@ class LaneBevCarrotNode(Node):
         row = int((wy - info.origin.position.y) / info.resolution)
         if not (0 <= col < info.width and 0 <= row < info.height): return -1
         return int(self._road_grid[row * info.width + col])
-    
+
     def _pothole_cost(self, wx, wy) -> int:
         if self._pothole_grid is None: return -1
         info = self._pothole_info
@@ -251,9 +272,9 @@ class LaneBevCarrotNode(Node):
             c = self._road_cost(px, py)
             if c != -1 and c >= self._safe_cost_max:
                 return False
-            
-        # --- POTHOLE CHECK (larger radius — hard avoidance) ---
-        pothole_r = 0.9  # metres — carrot must stay this far from any pothole cell
+
+        # --- POTHOLE CHECK (larger radius, hard avoidance) ---
+        pothole_r = 0.9  # metres, carrot must stay this far from any pothole cell
         for deg in range(0, 360, 30):
             a = math.radians(deg)
             pc = self._pothole_cost(wx + pothole_r * math.cos(a),
@@ -263,7 +284,7 @@ class LaneBevCarrotNode(Node):
         if self._pothole_cost(wx, wy) >= 50:
             return False
         # ------------------------------------------------------
-        
+
         if self._scan_pts_map is not None and len(self._scan_pts_map) > 0:
             dists = np.hypot(self._scan_pts_map[:, 0] - wx,
                              self._scan_pts_map[:, 1] - wy)
@@ -271,7 +292,7 @@ class LaneBevCarrotNode(Node):
                 return False
         return True
 
-    # ── BEV road fit ───────────────────────────────────────────────────
+    # -- BEV road fit --
 
     def _road_fit(self, bev):
         hsv  = cv2.cvtColor(bev, cv2.COLOR_BGR2HSV)
@@ -293,7 +314,7 @@ class LaneBevCarrotNode(Node):
             y -= self._win_h
         return np.polyfit(ys,xs,2) if len(xs)>=3 else None
 
-    # ── projection ─────────────────────────────────────────────────────
+    # -- projection --
 
     def _bev_to_ground(self, u_bev, v_bev, cam_pos, R_cam):
         pt = cv2.perspectiveTransform(
@@ -322,13 +343,13 @@ class LaneBevCarrotNode(Node):
                     break
         return best
 
-    # ── fallback carrot helpers ────────────────────────────────────────
+    # -- fallback carrot helpers --
 
     def _fallback_carrot(self, rx_map: float, ry_map: float, fwd: np.ndarray, map_yaw: float):
         """
         Sweep a grid of MAP-FRAME points ahead with lateral offsets.
-        rx_map, ry_map: robot position in MAP frame (from cam_pos projected to z=0,
-                        or base_link TF — NOT self._robot_x/y which is odom-frame).
+        rx_map, ry_map: robot position in MAP frame (base_link TF, NOT
+                        self._robot_x/y which is odom-frame).
         """
         lat_x = -math.sin(map_yaw)
         lat_y =  math.cos(map_yaw)
@@ -351,9 +372,21 @@ class LaneBevCarrotNode(Node):
         self.get_logger().warn(f'[straight-ahead] emergency carrot ({cx:.2f},{cy:.2f})')
         return (cx, cy)
 
-    # ── main tick ──────────────────────────────────────────────────────
+    # -- main tick --
 
     def _tick(self):
+        # -- Recovery handoff: stay completely silent while recovery owns the robot.
+        if self._recovery_active:
+            stamp = self._recovery_active_stamp
+            if stamp is not None:
+                age = (self.get_clock().now() - stamp).nanoseconds / 1e9
+                if age > self._recovery_timeout:
+                    self.get_logger().warn(
+                        f'/recovery_active stale {age:.1f}s - recovery node silent, resuming')
+                    self._recovery_active = False
+            if self._recovery_active:
+                return
+
         if self._final_goal is None or self._last_img is None:
             return
         gx = self._final_goal.pose.position.x
@@ -373,7 +406,7 @@ class LaneBevCarrotNode(Node):
         cam_pos = np.array([t.x, t.y, t.z])
         R_cam   = _qrot(cam_tf.transform.rotation)
 
-        # Robot pose in MAP frame — needed for fwd direction and fallback position.
+        # Robot pose in MAP frame, needed for fwd direction and fallback position.
         # self._robot_yaw is odom-frame; SLAM can rotate map vs odom so we MUST
         # use map->base_link TF for both position and heading.
         try:
@@ -389,22 +422,22 @@ class LaneBevCarrotNode(Node):
             [bq.x, bq.y, bq.z, bq.w])
         fwd = np.array([math.cos(map_yaw), math.sin(map_yaw)])
 
-        # ── Finish-line approach direction (computed once per goal) ─────
+        # -- Finish-line approach direction (computed once per goal) --
         if self._approach_dir is None:
             dx = gx - rx_map; dy = gy - ry_map
             d  = math.hypot(dx, dy)
             if d > 0.01:
                 self._approach_dir = (dx / d, dy / d)
 
-        # ── Locked carrot (near-goal persistence) ──────────────────────
+        # -- Locked carrot (near-goal persistence) --
         if self._carrot_locked and self._locked_carrot is not None:
             cx, cy = self._locked_carrot
-            # If locked AT the goal, never invalidate — finish line was crossed
+            # If locked AT the goal, never invalidate (finish line was crossed)
             if cx == gx and cy == gy:
                 pass  # fall through to publish below
             elif np.dot(fwd, np.array([cx - cam_pos[0], cy - cam_pos[1]])) <= 0 \
                     or not self._is_safe(cx, cy):
-                self.get_logger().info('Locked carrot invalidated — recomputing')
+                self.get_logger().info('Locked carrot invalidated - recomputing')
                 self._carrot_locked = False
                 self._locked_carrot = None
             if self._carrot_locked:  # still locked
@@ -419,7 +452,7 @@ class LaneBevCarrotNode(Node):
                 self._pub.publish(msg)
                 return
 
-        # ── BEV lane fit ───────────────────────────────────────────────
+        # -- BEV lane fit --
         bev   = cv2.warpPerspective(self._last_img, self._M, (self._bev_w, self._bev_h))
         fresh = self._road_fit(bev)
         if fresh is not None:
@@ -455,11 +488,11 @@ class LaneBevCarrotNode(Node):
                 if score < best_score:
                     best_score = score; carrot = pt
 
-        # ── Fallback chain when BEV yields nothing ─────────────────────
+        # -- Fallback chain when BEV yields nothing --
         if carrot is None:
             self._streak += 1
             self.get_logger().warn(
-                f'No BEV carrot (streak={self._streak}) — trying lateral sweep',
+                f'No BEV carrot (streak={self._streak}) - trying lateral sweep',
                 throttle_duration_sec=1.0)
 
             # Fallback 1: lateral grid search in map frame
@@ -471,26 +504,22 @@ class LaneBevCarrotNode(Node):
         else:
             self._streak = 0
 
-        # ── Finish-line gate: lock carrot at goal if carrot crossed the
-        #    perpendicular plane at the goal (dot-product gate, same logic
-        #    as goal_decomposer gate planes).
-        #    Also triggers on the old distance-based goal_tol check.
+        # -- Finish-line gate: lock carrot at goal if carrot crossed the
+        #    perpendicular plane at the goal (dot-product gate).
         if self._approach_dir is not None:
             adx, ady = self._approach_dir
-            # dot( carrot - goal , approach_dir ) >= 0 → carrot is past goal
             past_gate = ((carrot[0] - gx) * adx + (carrot[1] - gy) * ady) >= 0.0
         else:
             past_gate = False
 
         if past_gate or math.hypot(carrot[0]-gx, carrot[1]-gy) <= self._goal_tol:
-            # Snap carrot to exact goal and lock permanently
             carrot = (gx, gy)
             self._carrot_locked  = True
             self._locked_carrot  = carrot
             self.get_logger().info(
-                f'Finish line crossed — carrot locked at goal ({gx:.2f},{gy:.2f})')
+                f'Finish line crossed - carrot locked at goal ({gx:.2f},{gy:.2f})')
 
-        # ── Publish carrot ─────────────────────────────────────────────
+        # -- Publish carrot --
         dx  = carrot[0] - rx_map
         dy  = carrot[1] - ry_map
         yaw = math.atan2(dy, dx)
